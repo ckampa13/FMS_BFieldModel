@@ -99,3 +99,7 @@ scripts/*/*.pdf
 .ipynb_checkpoints
 
 
+
+### Claude Code
+CLAUDE.md
+CLAUDE/
