@@ -231,6 +231,17 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
     same probe, while helicalc's prism model of that conductor gives 0.36 G.  So
     the finite cross-section is not the problem -- the unmated end faces are.
 
+    USE closure='saddle'.  It is the cos(n.theta) topology (loop magnetic moment
+    radial, m.rhat = 1.000) with every joint arc-matched, and its residual
+    converges to ZERO rather than to chord closure's 4.4 G floor:
+
+        dxyz scale     1.0      0.5      0.25
+        r = 30 mm     0.523    0.107    0.028  G
+        r = 50 mm     1.410    0.342    0.088  G   (mapping boundary, worst case)
+
+    i.e. clean h^2 at both radii.  A quarter of the default step puts the worst
+    point at 0.088 G, well under the 0.3 G Hall-probe noise.
+
     FIX (verified): put an ARC element at each corner, with the adjoining straight
     bars' cross-section oriented so their faces mate.  An arc's end faces are
     perpendicular to its local tangent, so they mate exactly with a straight bar
