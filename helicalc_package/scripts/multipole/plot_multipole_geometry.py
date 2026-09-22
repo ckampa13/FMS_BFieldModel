@@ -425,7 +425,7 @@ def plot_layout(df, geom, path):
 
 
 # --------------------------------------------------------------- field maps
-def plot_field_maps(df, geom, path, n_grid=61, n_z=260):
+def plot_field_maps(df, geom, path, n_grid=121, n_z=260):
     '''Thin-wire field: transverse maps at four element centres + axial profile.
 
     Thin wire (no GPU) is plenty for a picture -- it tracks the full 3D field to
@@ -434,28 +434,49 @@ def plot_field_maps(df, geom, path, n_grid=61, n_z=260):
     picks = ['MQ', 'MCBH', 'MCS', 'MCT']
     specs = [s for s in ASSEMBLY_ELEMENTS if s['name'] in picks]
     R = geom.R_map
+    # sample the FULL square, not just the disc: streamplot needs a regular grid
+    # with no holes.  The disc is imposed afterwards as a clip path.
     g = np.linspace(-R, R, n_grid)
     X, Y = np.meshgrid(g, g)
-    inside = np.hypot(X, Y) <= R
 
     fig = plt.figure(figsize=(15, 8.0))
     gs = fig.add_gridspec(2, 4, height_ratios=[1.0, 0.85], hspace=0.30, wspace=0.55)
+    from matplotlib.colors import PowerNorm
     for j, spec in enumerate(specs):
         zc = 0.5 * (spec['z0'] + spec['z1'])
-        P = np.column_stack([X[inside], Y[inside], np.full(inside.sum(), zc)])
+        P = np.column_stack([X.ravel(), Y.ravel(), np.full(X.size, zc)])
         B = thin_wire_field(df[df.element == spec['name']], P)
-        mag = np.full(X.shape, np.nan)
-        mag[inside] = 1e4 * np.linalg.norm(B[:, :2], axis=1)
+        U = B[:, 0].reshape(X.shape)
+        V = B[:, 1].reshape(X.shape)
+        mag = 1e4 * np.hypot(U, V)
         ax = fig.add_subplot(gs[0, j])
-        im = ax.pcolormesh(X, Y, mag, shading='auto', cmap='viridis')
-        # transverse field direction
-        s = max(n_grid // 14, 1)
-        Us = np.full(X.shape, np.nan); Vs = np.full(X.shape, np.nan)
-        Us[inside] = B[:, 0]; Vs[inside] = B[:, 1]
-        ax.quiver(X[::s, ::s], Y[::s, ::s], Us[::s, ::s], Vs[::s, ::s],
-                  color='w', scale_units='xy', angles='xy', width=0.006,
-                  alpha=0.85)
+        # |B| ~ r**(n-1), so a 12-pole spans five decades across the bore and a
+        # linear colour scale shows nothing but the rim.  Undo the power so the
+        # structure is visible at every order.
+        gamma = 1.0 / max(spec['n'] - 1, 1)
+        # scale from the DISC only.  The field is computed on the full square so
+        # streamplot has a regular grid, but the square's corners sit at r = R*sqrt(2),
+        # outside the mapping volume and much closer to the conductors -- letting
+        # them set vmax made the quadrupole's bar read 13 T instead of 7.9 T.
+        disc = np.hypot(X, Y) <= R
+        vmin, vmax = mag[disc].min(), mag[disc].max()
+        im = ax.pcolormesh(X, Y, mag, shading='auto', cmap='viridis',
+                           norm=PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax))
+        # real field lines rather than fixed-length arrows: a quiver scaled to
+        # the field vanishes wherever the field is small, which is most of the
+        # bore for a high-order multipole
+        # (broken_streamlines needs matplotlib >= 3.6; this env has 3.3)
+        ax.streamplot(g, g, U, V, color='w', density=1.0, linewidth=0.7,
+                      arrowsize=0.8)
         ax.add_patch(Circle((0, 0), geom.R_ref, fill=False, ls=':', color='w', lw=1))
+        clip = Circle((0, 0), R, transform=ax.transData)
+        im.set_clip_path(clip)
+        for art in ax.get_children():
+            try:
+                art.set_clip_path(clip)
+            except Exception:
+                pass
+        ax.set_xlim(-R * 1.02, R * 1.02); ax.set_ylim(-R * 1.02, R * 1.02)
         ax.set_aspect('equal')
         ax.set_title('%s  (2n=%d%s)\nz = %.2f m' %
                      (spec['name'], 2 * spec['n'],

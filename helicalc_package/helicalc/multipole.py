@@ -305,27 +305,58 @@ def chord_segments(n, geom=None, **geom_overrides):
 # ----------------------------------------------------------------------------
 # closing a winding into current loops
 # ----------------------------------------------------------------------------
-def pair_bars(n, N):
-    '''Perfect matching of bar indices into pairs carrying opposite currents.
+def pair_bars(n, N, mode='mirror', skew=False):
+    """Perfect matching of bar indices into pairs carrying opposite currents.
 
-    The partner of bar i is bar i+m with m = N/(2n), because
-    theta_{i+m} = theta_i + pi/n and cos(n*theta) flips sign under that shift.
-    But i -> i+m is not an involution, so it is not itself a matching: adding m
-    repeatedly walks a cycle of length N/m = 2n.  Each such cycle is even, so we
-    take alternate edges around it -- pairs (0,1), (2,3), ... of each cycle --
-    which gives a perfect matching of all N bars into N/2 pairs.
+    A turn's two legs must carry equal and opposite current, and for
+    I ~ cos(n.theta) there are two families that do:
+
+    mode='mirror' (default, and how real magnets are wound)
+        theta_j = 2*alpha - theta_i about a zero crossing alpha of cos(n.theta).
+        There are 2n such crossings, and the turns NEST about each one, spanning
+        from a few degrees at the innermost turn out to nearly pi/n at the
+        outermost.  That gives 2n nested saddle bundles -- the classic picture of
+        a dipole as two saddles, a quadrupole as four, and so on.
+
+    mode='shift'
+        theta_j = theta_i + pi/n.  Also exactly opposite, and it produces the
+        same I(theta) and hence the same body field, but EVERY turn then spans
+        pi/n (a full 180 degrees for a dipole), so the winding reads as n wide
+        bundles rather than 2n nested saddles.  Kept because it is what the first
+        version of this module did; it is not how magnets are built.
+
+    The pairing affects only the end turns -- the body field depends on I(theta)
+    alone -- but the end turns are exactly where the fringe field lives.
 
     Returns a list of (i, j) index pairs with I[j] == -I[i].
-    '''
+    """
     if N % (2 * n) != 0:
-        raise ValueError('N=%d must be a multiple of 2n=%d for chord pairing'
+        raise ValueError('N=%d must be a multiple of 2n=%d for pairing'
                          % (N, 2 * n))
     m = N // (2 * n)
     pairs = []
-    for r in range(m):                      # one cycle per residue class mod m
-        cycle = [(r + j * m) % N for j in range(2 * n)]
-        for j in range(0, 2 * n, 2):        # alternate edges of an even cycle
-            pairs.append((cycle[j], cycle[j + 1]))
+    if mode == 'shift':
+        # i -> i+m is not an involution (adding m walks a cycle of length 2n),
+        # so take alternate edges around each even cycle
+        for r in range(m):
+            cycle = [(r + j * m) % N for j in range(2 * n)]
+            for j in range(0, 2 * n, 2):
+                pairs.append((cycle[j], cycle[j + 1]))
+    elif mode == 'mirror':
+        if m % 2:
+            raise ValueError('mirror pairing needs N/(2n)=%d even, i.e. N a '
+                             'multiple of 4n' % m)
+        # Fold about the zeros of the CURRENT pattern.  A skew winding is the
+        # normal one rotated by pi/(2n), so its zeros -- and therefore its mirror
+        # axes -- move by m/2 bars.  Folding a skew winding about the cosine
+        # zeros pairs same-sign bars and the winding cancels itself out.
+        off = m // 2 if skew else 0
+        for k in range(2 * n):
+            A2 = 2 * k * m + m - 1 + 2 * off        # twice the axis index
+            for i in range(k * m + off, k * m + off + m // 2):
+                pairs.append((i % N, (A2 - i) % N))
+    else:
+        raise ValueError("mode must be 'mirror' or 'shift'")
     return pairs
 
 
@@ -418,7 +449,7 @@ def close_winding(theta, I, z0, z1, geom, n, closure='chord', b=None,
 
     if closure == 'chord':
         k, offs = chord_segments(n, geom)
-        for loop_id, (i, j) in enumerate(pair_bars(n, N)):
+        for loop_id, (i, j) in enumerate(pair_bars(n, N, skew=skew)):
             if np.isclose(I[i], 0.0):
                 continue
             if not np.isclose(I[j], -I[i], rtol=1e-9, atol=1e-9 * max(abs(I[i]), 1.0)):
@@ -1475,6 +1506,10 @@ def saddle_end_geometry(th_i, th_j, a, rho):
     return C, R_c, P_i, P_j, u, v, dth
 
 
+def zt_guard(z0, z1, rho_p):
+    return (z1 - rho_p) <= (z0 + rho_p)
+
+
 def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
                          skew=False, cond_N_start=0, name='', atol=1e-9):
     '''cos(n.theta) saddle winding with arc-filleted, face-matched joints.
@@ -1494,15 +1529,25 @@ def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
     zhat = np.array([0.0, 0.0, 1.0])
     rows = []
     cn = cond_N_start
-    for loop_id, (i, j) in enumerate(pair_bars(n, N)):
+    for loop_id, (i, j) in enumerate(pair_bars(n, N, skew=skew)):
         if np.isclose(I[i], 0.0):
             continue
         cur = I[i]
         th_i, th_j = theta[i], theta[j]
-        C, R_c, P_i, P_j, u, v, dth = saddle_end_geometry(th_i, th_j, a, rho)
+        # The middle-arc centre sits at t = rho/sin(dtheta/2) along the bisector.
+        # With a fixed rho and a narrow turn that pushes t OUTSIDE the winding,
+        # and the arc then curves the wrong way round.  Capping rho at
+        # 0.5*a*sin(dtheta/2) keeps t <= a/2 for every pair, which matters once
+        # mirror pairing is used: its turns range from a few degrees to nearly
+        # pi/n, so one fillet radius cannot serve them all.
+        dth0 = (th_j - th_i) % (2 * np.pi)
+        rho_p = min(rho, 0.5 * a * np.sin(0.5 * dth0))
+        if rho_p <= 0 or zt_guard(z0, z1, rho_p):
+            raise ValueError('element too short for fillet radius %.4f' % rho_p)
+        C, R_c, P_i, P_j, u, v, dth = saddle_end_geometry(th_i, th_j, a, rho_p)
         ri, rj = a * u(th_i), a * u(th_j)
         pi_, pj_ = v(th_i), v(th_j)
-        zb, zt = z0 + rho, z1 - rho
+        zb, zt = z0 + rho_p, z1 - rho_p
         if zt <= zb:
             raise ValueError('element too short for fillet radius rho=%.4f' % rho)
         # (start, kind, payload) walked in current order
@@ -1510,13 +1555,13 @@ def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
         tw_j = C - P_j
         steps = [
             ('s', ri + zb * zhat, ri + zt * zhat, pi_),
-            ('a', ri + zt * zhat, zhat, pi_, rho, None),
+            ('a', ri + zt * zhat, zhat, pi_, rho_p, None),
             ('a', P_i + z1 * zhat, pi_, pj_, R_c, tw_i),
-            ('a', P_j + z1 * zhat, pj_, -zhat, rho, None),
+            ('a', P_j + z1 * zhat, pj_, -zhat, rho_p, None),
             ('s', rj + zt * zhat, rj + zb * zhat, pj_),
-            ('a', rj + zb * zhat, -zhat, -pj_, rho, None),
+            ('a', rj + zb * zhat, -zhat, -pj_, rho_p, None),
             ('a', P_j + z0 * zhat, -pj_, -pi_, R_c, tw_j),
-            ('a', P_i + z0 * zhat, -pi_, zhat, rho, None),
+            ('a', P_i + z0 * zhat, -pi_, zhat, rho_p, None),
         ]
         cursor = ri + zb * zhat
         for st in steps:
@@ -1536,7 +1581,7 @@ def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
                                           geom.W, geom.T,
                                           name='%s end %d' % (name, loop_id),
                                           element=element, n=n, skew=skew,
-                                          seg_kind='corner' if rr == rho else 'endarc',
+                                          seg_kind='corner' if rr == rho_p else 'endarc',
                                           loop=loop_id, toward=tw)
                 rows.append(row)
                 cursor = p_end
