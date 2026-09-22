@@ -47,7 +47,7 @@ def build_parser():
                    help='min conductor radius [m]; default R_aper')
     p.add_argument('--N-target', type=int, default=32,
                    help='bars per winding before rounding to a multiple of 4n')
-    p.add_argument('--closure', default='chord', choices=['chord', 'radial'],
+    p.add_argument('--closure', default='chord', choices=['chord', 'radial', 'arc'],
                    help='winding closure (default chord)')
     p.add_argument('--return-radius', type=opt_float, default=None,
                    help="return radius b [m], required for --closure radial")
@@ -93,12 +93,20 @@ def main(argv=None):
     print('  r_clear         %8.1f mm' % (1e3 * geom.r_clear))
     print('  N_target        %8d' % geom.N_target)
     print()
-    print('  per order: bars N (multiple of 4n) and end-turn segments k')
-    for n in range(1, 7):
-        N = bars_per_pole(n, geom.N_target)
-        k, _ = chord_segments(n, geom)
-        print('    n=%d  N=%3d  k=%d  end-turn r_min=%.1f mm'
-              % (n, N, k, 1e3 * geom.a * np.cos(np.pi / (2 * n * k))))
+    if args.closure == 'chord':
+        print('  per order: bars N (multiple of 4n) and end-turn segments k')
+        for n in range(1, 7):
+            N = bars_per_pole(n, geom.N_target)
+            k, _ = chord_segments(n, geom)
+            print('    n=%d  N=%3d  k=%d  end-turn r_min=%.1f mm'
+                  % (n, N, k, 1e3 * geom.a * np.cos(np.pi / (2 * n * k))))
+    else:
+        print('  per order: bars N (multiple of 4n); closure=%s' % args.closure)
+        for n in range(1, 7):
+            print('    n=%d  N=%3d' % (n, bars_per_pole(n, geom.N_target)))
+        if args.closure == 'arc':
+            print('  return radius b = %.1f mm (joint-matched arc corners)'
+                  % (1e3 * (args.return_radius or 2 * geom.a)))
     print()
 
     df = build_assembly(layout=layout, corrector_scale=args.corrector_scale,
@@ -113,7 +121,10 @@ def main(argv=None):
     summary = summarize_assembly(df)
     print(summary.to_string(index=False, float_format=lambda v: '%.3f' % v))
     print()
-    print('  total bars            %d' % len(df))
+    from helicalc.multipole_field import arc_mask
+    n_arc = int(arc_mask(df).sum())
+    print('  total elements        %d  (%d straight, %d arc)'
+          % (len(df), len(df) - n_arc, n_arc))
     print('  total conductor       %.1f m' % df['length'].sum())
 
     ok, worst, _ = check_closure(df)

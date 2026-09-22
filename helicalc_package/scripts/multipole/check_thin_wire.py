@@ -46,6 +46,8 @@ def main(argv=None):
     p.add_argument('--aperture', type=float, default=0.150)
     p.add_argument('--winding-radius', default='0.090')
     p.add_argument('--N-target', type=int, default=32)
+    p.add_argument('--closure', default='chord',
+                   choices=['chord', 'radial', 'arc'])
     args = p.parse_args(argv)
     a = None if str(args.winding_radius).lower() in ('auto', 'none', '') \
         else float(args.winding_radius)
@@ -102,7 +104,7 @@ def main(argv=None):
     print('=' * 78)
     print('3. Assembly geometry')
     print('=' * 78)
-    df = build_assembly(geom=geom)
+    df = build_assembly(geom=geom, closure=args.closure)
     ok, worst_I, _ = check_closure(df)
     scale = float(np.abs(df['I']).max())
     report('Kirchhoff residual / peak current', worst_I / scale, 0.0, 1e-12,
@@ -114,7 +116,8 @@ def main(argv=None):
              1e3 * geom.r_clear))
     if rmin < max(geom.R_map, geom.r_clear) - 1e-9:
         FAILURES.append('min conductor radius')
-    print('  %-40s %d' % ('total bars', len(df)))
+    print('  %-40s %s' % ('closure', args.closure))
+    print('  %-40s %d' % ('total elements', len(df)))
     print('  %-40s %.1f m' % ('total conductor length', df['length'].sum()))
 
     print()
@@ -162,7 +165,8 @@ def main(argv=None):
     print('  discretisation should show up only at orders n +/- N')
     for n in (2, 4):
         from helicalc.multipole import make_cosn_winding
-        w = make_cosn_winding(n, 20.0, 0.0, B_ref=1.0, geom=geom)
+        w = make_cosn_winding(n, 20.0, 0.0, B_ref=1.0, geom=geom,
+                              closure=args.closure)
         h = circle_harmonics(w, geom.R_ref, 0.0, M=1024, n_max=24)
         main = h[n][0]
         spur = max(abs(h[m][0] / main) for m in range(1, 25)

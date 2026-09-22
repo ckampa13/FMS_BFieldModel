@@ -15,13 +15,22 @@ import pandas as pd
 import torch as tc
 from tqdm import tqdm
 
-from .busbar import StraightIntegrator3D
+from .busbar import StraightIntegrator3D, ArcIntegrator3D
 from .constants import MAXMEM
 from . import tools as _tools
 
 # cross-section sampling for a multipole bar (W=8mm, T=15mm by default):
 # 5 x 6 nodes across the conductor, 5 mm along it.
 DXYZ_MULTIPOLE = np.array([2e-3, 3e-3, 5e-3])
+
+# Arcs need a finer step than straights at the same linear resolution: a corner
+# fillet is short, tightly curved and sits close to the mapping volume, so its
+# integrand varies far faster along the element than a 1.5 m body bar's does.
+# Measured on the MQ winding, the curl-free residual at the element end falls
+# 0.84 -> 0.19 -> 0.046 -> 0.011 G as this is halved, i.e. clean h^2 convergence
+# TO ZERO (contrast the chord closure, which converges to a nonzero 4.4 G).
+# A quarter of the straight-bar step puts it comfortably under the 0.3 G noise.
+DXYZ_MULTIPOLE_ARC = np.array([0.5e-3, 0.75e-3, 1.25e-3])
 
 # bytes per element and number of (N_batch, nx, ny, nz) arrays that
 # StraightIntegrator3D.integrate_vec holds live at once
@@ -63,11 +72,40 @@ def clear_gpu_memory_cache():
 # ----------------------------------------------------------------------------
 # batch sizing
 # ----------------------------------------------------------------------------
+def is_arc(row):
+    return 'kind' in row.index and row['kind'] == 'arc'
+
+
+def arc_mask(df):
+    '''Boolean Series marking arc rows; all-False when there is no `kind` column.
+
+    df.get('kind', 'straight') returns a SCALAR for a frame without the column,
+    which then indexes the frame with a bare bool and raises -- so build the mask
+    explicitly.
+    '''
+    if 'kind' in df.columns:
+        return df['kind'].values == 'arc'
+    return np.zeros(len(df), dtype=bool)
+
+
+def arc_dxyz(row, dxyz):
+    '''helicalc's arc integrator reads dxyz[2] as d(phi) ASSUMING R = 1 m, so it
+    has to be divided by the actual bend radius to get the intended arc length
+    step.  Getting this wrong silently changes the integration density.'''
+    d = np.asarray(dxyz, float).copy()
+    d[2] = d[2] / float(row['R_curve'])
+    return d
+
+
 def integration_node_count(row, dxyz):
-    '''(nx, ny, nz) integration nodes helicalc will build for one bar.'''
+    '''(nx, ny, nz) integration nodes helicalc will build for one element.'''
     nx = abs(int(row['W'] / dxyz[0] + 1))
     ny = abs(int(row['T'] / dxyz[1] + 1))
-    nz = abs(int(row['length'] / dxyz[2] + 1))
+    if is_arc(row):
+        dphi = np.radians(float(row['dphi']))
+        nz = abs(int(dphi / arc_dxyz(row, dxyz)[2] + 1))
+    else:
+        nz = abs(int(row['length'] / dxyz[2] + 1))
     return nx, ny, nz
 
 
@@ -83,6 +121,15 @@ def resolve_dxyz(row, dxyz, min_nodes=3):
     size = np.array([row['W'], row['T'], row['length']], float)
     need = size / max(min_nodes - 1, 1)
     return np.minimum(np.asarray(dxyz, float), need)
+
+
+def build_integrator(row, dxyz, dev, lib, int_func, min_nodes=3):
+    '''StraightIntegrator3D or ArcIntegrator3D, with the right dxyz for each.'''
+    d = resolve_dxyz(row, dxyz, min_nodes)
+    if is_arc(row):
+        return ArcIntegrator3D(row, dxyz=arc_dxyz(row, d), dev=dev, lib=lib,
+                               int_func=int_func)
+    return StraightIntegrator3D(row, dxyz=d, dev=dev, lib=lib, int_func=int_func)
 
 
 def check_integration_nodes(df, dxyz, min_nodes=3, adapt=True):
@@ -149,7 +196,7 @@ def promote_nodes_to_float64(integ):
 def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
               per_element=False, units='T', tqdm=tqdm, lib=tc, int_func=None,
               prefix='B', verbose=True, check_nodes=True, min_nodes=3,
-              float64_nodes=False):
+              float64_nodes=False, dxyz_arc=None):
     '''Sum StraightIntegrator3D over every bar in df_bars.
 
     df_points : DataFrame with X, Y, Z columns [m] (HP is carried through).
@@ -212,10 +259,20 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
     if dxyz is None:
         dxyz = DXYZ_MULTIPOLE
     dxyz = np.asarray(dxyz, float)
+    if dxyz_arc is None:
+        # scale the arc default the same way the caller scaled the straight one
+        dxyz_arc = DXYZ_MULTIPOLE_ARC * (dxyz / DXYZ_MULTIPOLE)
+    dxyz_arc = np.asarray(dxyz_arc, float)
     if int_func is None:
         int_func = tc.trapz if lib is tc else np.trapz
     if check_nodes:
-        check_integration_nodes(df_bars, dxyz, min_nodes=min_nodes)
+        m = arc_mask(df_bars)
+        straights = df_bars[~m]
+        arcs = df_bars[m]
+        if len(straights):
+            check_integration_nodes(straights, dxyz, min_nodes=min_nodes)
+        if len(arcs):
+            check_integration_nodes(arcs, dxyz_arc, min_nodes=min_nodes)
     enable_gpu_memory_cache()
 
     scale = 1e4 if units == 'G' else 1.0
@@ -238,12 +295,11 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
         row = pd.Series(rec._asdict())
         if float(row['I']) == 0.0:
             continue
-        d_bar = resolve_dxyz(row, dxyz, min_nodes)
-        nb = N_batch or estimate_batch_size(row, dxyz, mem_frac=mem_frac,
+        d_row = dxyz_arc if is_arc(row) else dxyz
+        nb = N_batch or estimate_batch_size(row, d_row, mem_frac=mem_frac,
                                             min_nodes=min_nodes)
-        integ = StraightIntegrator3D(row, dxyz=d_bar, dev=dev, lib=lib,
-                                     int_func=int_func)
-        if float64_nodes and lib is tc:
+        integ = build_integrator(row, d_row, dev, lib, int_func, min_nodes)
+        if float64_nodes and lib is tc and not is_arc(row):
             promote_nodes_to_float64(integ)
         acc = np.zeros((3, npts))
         for s in range(0, npts, nb):

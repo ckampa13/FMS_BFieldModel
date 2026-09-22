@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 from scipy.optimize import fsolve
+from scipy.spatial.transform import Rotation
 
 from .constants import mu0
 
@@ -332,6 +333,52 @@ def _cyl(a, theta, z):
     return np.array([a * np.cos(theta), a * np.sin(theta), z])
 
 
+def measure_Bn(df, n, skew, zc, geom, M=256):
+    """B_n (or A_n) at R_ref in the plane z = zc, from the thin-wire field.
+
+    Thin wire is enough for calibration: it tracks the full 3D field to well
+    under a percent and costs no GPU.
+    """
+    ph = 2 * np.pi * np.arange(M) / M
+    pts = np.column_stack([geom.R_ref * np.cos(ph), geom.R_ref * np.sin(ph),
+                           np.full(M, zc)])
+    B = thin_wire_field(df, pts)
+    h = harmonics_from_field(B[:, 0], B[:, 1], ph, n_max=max(n, 2))
+    return h[n][1] if skew else h[n][0]
+
+
+def calibrate_winding(df, n, skew, zc, geom, B_target, M=256):
+    """Rescale every current so the winding actually delivers B_target.
+
+    The analytic current formula is a 2D infinite-shell result.  Real windings
+    miss it by a few percent because of their ends, and an arc-closed racetrack
+    around a SHORT element misses it by more than 10% because its return legs and
+    corner fillets are then comparable to the element length.  One thin-wire
+    evaluation fixes that exactly, for any closure.
+    """
+    got = measure_Bn(df, n, skew, zc, geom, M)
+    if abs(got) < 1e-12:
+        raise ValueError('winding produced no measurable main field')
+    scale = B_target / got
+    out = df.copy()
+    out['I'] = out['I'].values * scale
+    out['J'] = out['J'].values * scale
+    return out, scale
+
+
+def default_return_radius(closure, geom, b=None):
+    """Return radius for the closures that need one.
+
+    'radial' and 'arc' close each bar through a return leg at radius b; the body
+    field then carries a [1 - (a/b)**n] factor, which current_for_strength undoes.
+    b = 2a keeps that factor within a few percent of 1 for n >= 2 while staying
+    compact.  'chord' needs no return radius.
+    """
+    if closure in ('radial', 'arc') and b is None:
+        return 2.0 * geom.a
+    return b
+
+
 def close_winding(theta, I, z0, z1, geom, n, closure='chord', b=None,
                   element='', skew=False, cond_N_start=0, name=''):
     '''Build the closed set of straight bars for one winding.
@@ -407,14 +454,17 @@ def close_winding(theta, I, z0, z1, geom, n, closure='chord', b=None,
                                          psi_mode=pm, element=element, n=n,
                                          skew=skew, seg_kind=tag, loop=i))
                 cn += 1
+    elif closure == 'arc':
+        rows = close_winding_arc(theta, I, z0, z1, geom, n, b=b, element=element,
+                                 skew=skew, cond_N_start=cond_N_start, name=name)
     else:
-        raise ValueError("closure must be 'chord' or 'radial'")
+        raise ValueError("closure must be 'chord', 'radial' or 'arc'")
     return rows
 
 
 def make_cosn_winding(n, L, zc, B_ref=None, I0=None, skew=False, geom=None,
                       closure='chord', b=None, N=None, cond_N_start=0,
-                      element='', name=None, **geom_overrides):
+                      element='', name=None, calibrate=True, **geom_overrides):
     '''Closed cos(n.theta) (normal) or sin(n.theta) (skew) winding.
 
     Exactly one of B_ref [T] (the target B_n at geom.R_ref) or I0 [A] must be given.
@@ -425,6 +475,7 @@ def make_cosn_winding(n, L, zc, B_ref=None, I0=None, skew=False, geom=None,
         N = bars_per_pole(n, g.N_target)
     if (B_ref is None) == (I0 is None):
         raise ValueError('give exactly one of B_ref or I0')
+    b = default_return_radius(closure, g, b)
     if I0 is None:
         I0 = current_for_strength(n, B_ref, N, g, b=b)
     if name is None:
@@ -437,7 +488,10 @@ def make_cosn_winding(n, L, zc, B_ref=None, I0=None, skew=False, geom=None,
     rows = close_winding(theta, I, zc - 0.5 * L, zc + 0.5 * L, g, n,
                          closure=closure, b=b, element=element, skew=skew,
                          cond_N_start=cond_N_start, name=name)
-    return bars_to_df(rows)
+    df = bars_to_df(rows)
+    if calibrate and B_ref is not None:
+        df, _ = calibrate_winding(df, n, skew, zc, g, B_ref)
+    return df
 
 
 # ----------------------------------------------------------------------------
@@ -462,7 +516,7 @@ def check_closure(df, tol=1e-9, decimals=9):
     Returns (ok, worst_residual, df_nodes).  An open winding gives a field that
     is not divergence-free, so this must pass before any field calculation.
     '''
-    p0, p1 = bar_endpoints(df)
+    p0, p1 = element_endpoints(df)
     I = df['I'].values.astype(float)
     net = {}
     for pt, sgn in ((p0, -1.0), (p1, +1.0)):        # current leaves p0, enters p1
@@ -479,10 +533,13 @@ def check_closure(df, tol=1e-9, decimals=9):
 
 def min_conductor_radius(df, n_sample=64):
     '''Closest approach of any conductor centreline to the z axis [m].'''
-    p0, p1 = bar_endpoints(df)
-    t = np.linspace(0.0, 1.0, n_sample)[None, :, None]
-    pts = p0[:, None, :] + t * (p1 - p0)[:, None, :]
-    return float(np.hypot(pts[..., 0], pts[..., 1]).min())
+    best = np.inf
+    for pts, _ in as_polylines(df, n_seg=n_sample):
+        t = np.linspace(0.0, 1.0, n_sample)[:, None]
+        for k in range(len(pts) - 1):
+            seg = pts[k] + t * (pts[k + 1] - pts[k])
+            best = min(best, float(np.hypot(seg[:, 0], seg[:, 1]).min()))
+    return best
 
 
 def integration_nodes(df, dxyz):
@@ -504,10 +561,11 @@ def integration_nodes(df, dxyz):
 # ----------------------------------------------------------------------------
 # thin-wire reference field (numpy only, no GPU)
 # ----------------------------------------------------------------------------
-def thin_wire_field(df, points):
+def thin_wire_field(df, points, n_arc_seg=64):
     '''Exact Biot-Savart for finite straight segments on the bar centrelines.
 
-    points : (M,3) array [m].  Returns (M,3) B in tesla.
+    points : (M,3) array [m].  Returns (M,3) B in tesla.  Arc elements are
+    discretised into n_arc_seg straight segments.
 
     This ignores the conductor cross-section, so it differs from the full 3D
     integral at O((T/d)^2) for a field point a distance d from the bar, but it
@@ -515,10 +573,12 @@ def thin_wire_field(df, points):
     regression on signs, orientations and the cos(n.theta) normalisation.
     '''
     pts = np.atleast_2d(np.asarray(points, float))
-    p0, p1 = bar_endpoints(df)
-    I = df['I'].values.astype(float)
+    segs = []
+    for poly, cur in as_polylines(df, n_seg=n_arc_seg):
+        for k in range(len(poly) - 1):
+            segs.append((poly[k], poly[k + 1], cur))
     B = np.zeros_like(pts)
-    for A, C, cur in zip(p0, p1, I):
+    for A, C, cur in segs:
         if cur == 0.0:
             continue
         # standard finite-segment formula
@@ -707,7 +767,7 @@ def sector_bar_currents(n, theta, blocks, I0, edge_mode='fractional'):
 def make_sector_winding(n, L, zc, blocks, B_ref=None, I0=None, skew=False,
                         geom=None, closure='chord', b=None, N=None,
                         cond_N_start=0, element='', name=None,
-                        edge_mode='fractional', **geom_overrides):
+                        edge_mode='fractional', calibrate=True, **geom_overrides):
     '''Closed sector-block winding: uniform |I| bars in angular blocks.
 
     Unlike a cos(n.theta) shell this has realistic allowed harmonics b_{n(2j+1)}
@@ -726,6 +786,7 @@ def make_sector_winding(n, L, zc, blocks, B_ref=None, I0=None, skew=False,
         if lo < -1e-9 or hi > half + 1e-9 or hi <= lo:
             raise ValueError('block (%.4f, %.4f) deg outside [0, %.4f] for n=%d'
                              % (lo, hi, half, n))
+    b = default_return_radius(closure, g, b)
     theta = bar_angles_grid(N)
     if skew:
         theta_eff = theta - np.pi / (2 * n)     # rotate the pattern by 90/n deg
@@ -747,13 +808,17 @@ def make_sector_winding(n, L, zc, blocks, B_ref=None, I0=None, skew=False,
     rows = close_winding(theta, I, zc - 0.5 * L, zc + 0.5 * L, g, n,
                          closure=closure, b=b, element=element, skew=skew,
                          cond_N_start=cond_N_start, name=name)
-    return bars_to_df(rows)
+    df = bars_to_df(rows)
+    if calibrate and B_ref is not None:
+        df, _ = calibrate_winding(df, n, skew, zc, g, B_ref)
+    return df
 
 
 # ----------------------------------------------------------------------------
 # analytic 2D harmonics of a discrete bar shell
 # ----------------------------------------------------------------------------
-def multipole_coeffs_2d(theta, I, geom=None, orders=range(1, 21), **geom_overrides):
+def multipole_coeffs_2d(theta, I, geom=None, orders=range(1, 21), b=None,
+                        **geom_overrides):
     '''Exact interior multipole coefficients of infinite line currents at r=a.
 
     For wires at (a, theta_i) carrying I_i, the interior field is
@@ -772,13 +837,18 @@ def multipole_coeffs_2d(theta, I, geom=None, orders=range(1, 21), **geom_overrid
     out = {}
     for m in orders:
         scale = pre * (g.R_ref / g.a) ** (m - 1)
+        if b is not None:
+            # a return shell at radius b carrying -I_i multiplies order m by
+            # [1 - (a/b)**m]; this is order-dependent, so it changes the
+            # harmonic RATIOS, not just the main field
+            scale = scale * (1.0 - (g.a / b) ** m)
         out[m] = (scale * np.sum(I * np.cos(m * theta)),
                   scale * np.sum(I * np.sin(m * theta)))
     return out
 
 
 def discrete_sector_harmonics(n, blocks, N, geom=None, orders=(6, 10, 14),
-                              edge_mode='fractional', **geom_overrides):
+                              edge_mode='fractional', b=None, **geom_overrides):
     '''Allowed harmonics in units for the DISCRETE sector winding of N bars.
 
     Unlike sector_harmonics (a continuous thin shell) this accounts for the
@@ -789,7 +859,7 @@ def discrete_sector_harmonics(n, blocks, N, geom=None, orders=(6, 10, 14),
     g = _resolve_geom(geom, geom_overrides)
     theta = bar_angles_grid(N)
     I = sector_bar_currents(n, theta, blocks, 1.0, edge_mode)
-    c = multipole_coeffs_2d(theta, I, g, orders=tuple(orders) + (n,))
+    c = multipole_coeffs_2d(theta, I, g, orders=tuple(orders) + (n,), b=b)
     main = c[n][0]
     if abs(main) < 1e-30:
         raise ValueError('blocks produce no main field')
@@ -797,7 +867,7 @@ def discrete_sector_harmonics(n, blocks, N, geom=None, orders=(6, 10, 14),
 
 
 def solve_sector_blocks_discrete(n, targets, N, geom=None, n_blocks=2, x0=None,
-                                 edge_mode='fractional', **geom_overrides):
+                                 edge_mode='fractional', b=None, **geom_overrides):
     '''Solve block edges so the DISCRETE N-bar winding hits the target harmonics.
 
     Same interface as solve_sector_blocks but exact for the winding that gets
@@ -817,7 +887,7 @@ def solve_sector_blocks_discrete(n, targets, N, geom=None, n_blocks=2, x0=None,
     def resid(p):
         blocks = to_blocks(p)
         try:
-            h = discrete_sector_harmonics(n, blocks, N, g, orders, edge_mode)
+            h = discrete_sector_harmonics(n, blocks, N, g, orders, edge_mode, b=b)
         except ValueError:
             return [1e6] * (len(orders) + n_free)
         r = [h[m] - targets[m] for m in orders]
@@ -987,8 +1057,9 @@ def build_assembly(layout='full', corrector_scale=1.0, quad_harmonics='sector',
         N = bars_per_pole(n, g_el.N_target)
 
         if spec['name'] == 'MQ' and quad_harmonics == 'sector':
+            b_el = default_return_radius(closure, g_el, b)
             blocks = solve_sector_blocks_discrete(n, mq_targets, N, g_el,
-                                                  edge_mode=edge_mode)
+                                                  edge_mode=edge_mode, b=b_el)
             df = make_sector_winding(n, L, zc, blocks, B_ref=B, skew=spec['skew'],
                                      geom=g_el, closure=closure, b=b, N=N,
                                      cond_N_start=cn, element=spec['name'],
@@ -1060,3 +1131,270 @@ def summarize_assembly(df, geom=None):
         'I_peak_A': grp['I'].apply(lambda s: np.abs(s).max()),
     })
     return out.reset_index()
+
+
+# ----------------------------------------------------------------------------
+# arc closure: joint-matched corners
+# ----------------------------------------------------------------------------
+# Straight prisms butted end to end do not mate where they meet at an angle --
+# each one's current stops on a flat face perpendicular to its OWN axis, so a
+# wedge at the joint carries no current and the computed field picks up a
+# spurious curl (see multipole_field.add_field.__doc__).  An arc element's end
+# faces are perpendicular to its local tangent, so they mate exactly with a
+# straight bar of the same Euler angles, and helicalc's arc integrand carries
+# the (R - y') Jacobian so the current stays uniform through the bend.
+#
+# The catch: helicalc's arc bends in its LOCAL y-z plane, i.e. T must lie in the
+# bend plane.  Every bend of a loop therefore has to share one plane, otherwise
+# a bar between two non-coplanar bends cannot mate at both ends.  That rules out
+# chord closure for n <= 2 (its end turns need several segments on the cylinder
+# to clear the bore, which is not planar) and points at radial-return
+# racetracks: each winding bar returns at radius b at its OWN azimuth, so the
+# whole loop lies in the plane spanned by r_hat(theta) and z_hat, all four bends
+# are in that plane, and no conductor ever comes inside r = a.
+
+ARC_EXTRA_COLS = ['kind', 'R_curve', 'dphi']
+
+
+def euler_from_frame(ex, ey, ez):
+    '''ZYZ Euler angles (Phi2, theta2, psi2) for the local frame (ex, ey, ez).
+
+    helicalc builds Rotation.from_euler('zyz', [Phi2, theta2, psi2][::-1]), so
+    the matrix whose columns are the images of the local axes is inverted here
+    with as_euler in the same order.
+    '''
+    M = np.column_stack([np.asarray(ex, float), np.asarray(ey, float),
+                         np.asarray(ez, float)])
+    if abs(np.linalg.det(M) - 1.0) > 1e-6:
+        raise ValueError('frame is not right-handed orthonormal (det=%.6f)'
+                         % np.linalg.det(M))
+    psi2, theta2, Phi2 = Rotation.from_matrix(M).as_euler('zyz', degrees=True)
+    return Phi2, theta2, psi2
+
+
+def _frame_for(ez, ey):
+    '''Right-handed orthonormal frame with given flow (ez) and T direction (ey).'''
+    ez = np.asarray(ez, float)
+    ez = ez / np.linalg.norm(ez)
+    ey = np.asarray(ey, float)
+    ey = ey - np.dot(ey, ez) * ez
+    ey = ey / np.linalg.norm(ey)
+    ex = np.cross(ey, ez)
+    return ex, ey, ez
+
+
+def make_straight_row_framed(p0, p1, ey, I, cond_N, W, T, name='', element='',
+                             n=0, skew=False, seg_kind='axial', loop=-1):
+    '''Straight bar with the cross-section pinned by an explicit T direction.
+
+    make_bar_row picks psi2 from a heuristic; here the caller supplies it, which
+    is what mating with an arc requires.
+    '''
+    p0 = np.asarray(p0, float)
+    p1 = np.asarray(p1, float)
+    L = float(np.linalg.norm(p1 - p0))
+    ex, ey, ez = _frame_for(p1 - p0, ey)
+    Phi2, theta2, psi2 = euler_from_frame(ex, ey, ez)
+    mid = 0.5 * (p0 + p1)
+    return {
+        'Name/role': name, 'cond N': int(cond_N), 'kind': 'straight',
+        'R0': float(np.hypot(p0[0], p0[1])),
+        'phi0': float(np.degrees(np.arctan2(p0[1], p0[0]))),
+        'R1': float(np.hypot(p1[0], p1[1])),
+        'phi1': float(np.degrees(np.arctan2(p1[1], p1[0]))),
+        'dphi': np.nan, 'R_curve': np.nan, 'length': L,
+        "x0'": np.nan, 'x0': p0[0], 'y0': p0[1], 'z0': p0[2],
+        "x1'": np.nan, 'x1': p1[0], 'y1': p1[1], 'z1': p1[2],
+        'xmid': mid[0], 'ymid': mid[1], 'z_mid': mid[2],
+        'W': W, 'T': T, 'I': I, 'J': I / (W * T), 'I_flow': 0,
+        'alpha': np.nan, 'Phi2': Phi2, 'theta2': theta2, 'psi2': psi2,
+        'element': element, 'n': n, 'skew': bool(skew),
+        'seg_kind': seg_kind, 'loop': loop,
+    }
+
+
+def make_arc_row(p_start, d_in, d_out, rho, I, cond_N, W, T, name='',
+                 element='', n=0, skew=False, seg_kind='corner', loop=-1):
+    '''Circular-arc corner turning the current from d_in to d_out.
+
+    p_start is the tangent point where the incoming straight bar ends.  The arc
+    starts there flowing along d_in and bends toward the centre of curvature,
+    which is the local +y direction -- so T lies in the bend plane, as helicalc's
+    arc element requires.  Returns the row plus the arc's end point.
+    '''
+    d_in = np.asarray(d_in, float)
+    d_in /= np.linalg.norm(d_in)
+    d_out = np.asarray(d_out, float)
+    d_out /= np.linalg.norm(d_out)
+    cosang = float(np.clip(np.dot(d_in, d_out), -1.0, 1.0))
+    dphi = np.degrees(np.arccos(cosang))
+    if dphi < 1e-9:
+        raise ValueError('arc corner with no turn')
+    # centre of curvature lies in the turn plane, perpendicular to d_in,
+    # on the side d_out turns toward
+    toward = d_out - cosang * d_in
+    toward /= np.linalg.norm(toward)
+    ex, ey, ez = _frame_for(d_in, toward)
+    Phi2, theta2, psi2 = euler_from_frame(ex, ey, ez)
+    p_start = np.asarray(p_start, float)
+    # local end point of the centreline (dy = 0)
+    a = np.radians(dphi)
+    loc = np.array([0.0, -rho * np.cos(a) + rho, rho * np.sin(a)])
+    p_end = p_start + Rotation.from_euler(
+        'zyz', np.array([Phi2, theta2, psi2])[::-1], degrees=True).apply(loc)
+    row = {
+        'Name/role': name, 'cond N': int(cond_N), 'kind': 'arc',
+        'R0': np.nan, 'phi0': np.nan, 'R1': np.nan, 'phi1': np.nan,
+        'dphi': dphi, 'R_curve': rho, 'length': rho * a,
+        "x0'": np.nan, 'x0': p_start[0], 'y0': p_start[1], 'z0': p_start[2],
+        "x1'": np.nan, 'x1': p_end[0], 'y1': p_end[1], 'z1': p_end[2],
+        'xmid': np.nan, 'ymid': np.nan, 'z_mid': np.nan,
+        'W': W, 'T': T, 'I': I, 'J': I / (W * T), 'I_flow': 0,
+        'alpha': np.nan, 'Phi2': Phi2, 'theta2': theta2, 'psi2': psi2,
+        'element': element, 'n': n, 'skew': bool(skew),
+        'seg_kind': seg_kind, 'loop': loop,
+    }
+    return row, p_end
+
+
+def racetrack_arc_loop(corners, ey_plane, rho, I, cond_N_start, W, T,
+                       element='', n=0, skew=False, loop=-1, name=''):
+    '''Closed planar loop through `corners`, with an arc filleting each corner.
+
+    corners : (m, 3) vertices of the closed polygon, all in one plane.
+    ey_plane: any vector in that plane (used only to check planarity).
+    rho     : fillet radius, trimmed if a leg is too short.
+
+    Straight runs are shortened to the tangent points so each straight face mates
+    with the adjoining arc face exactly.
+    '''
+    V = np.asarray(corners, float)
+    m = len(V)
+    nrm = np.cross(V[1] - V[0], V[2] - V[1])
+    nrm = nrm / np.linalg.norm(nrm)
+    for q in range(m):
+        if abs(np.dot(V[q] - V[0], nrm)) > 1e-9:
+            raise ValueError('racetrack_arc_loop needs a planar loop')
+    dirs = []
+    for q in range(m):
+        d = V[(q + 1) % m] - V[q]
+        dirs.append(d / np.linalg.norm(d))
+    legs = [np.linalg.norm(V[(q + 1) % m] - V[q]) for q in range(m)]
+    # per-corner fillet radius, trimmed so adjacent fillets never overlap
+    rhos = []
+    for q in range(m):
+        d_in, d_out = dirs[(q - 1) % m], dirs[q]
+        ang = np.arccos(np.clip(np.dot(d_in, d_out), -1.0, 1.0))
+        t = np.tan(ang / 2.0)
+        rmax = 0.49 * min(legs[(q - 1) % m], legs[q]) * (1.0 / t if t > 0 else 1e9)
+        rhos.append(min(rho, rmax))
+    rows = []
+    cn = cn0 = cond_N_start
+    for q in range(m):
+        d_in, d_out = dirs[(q - 1) % m], dirs[q]
+        # tangent points either side of vertex q
+        ang = np.arccos(np.clip(np.dot(d_in, d_out), -1.0, 1.0))
+        t_off = rhos[q] * np.tan(ang / 2.0)
+        T_in = V[q] - t_off * d_in
+        row, p_end = make_arc_row(T_in, d_in, d_out, rhos[q], I, cn, W, T,
+                                  name='%s corner %d' % (name, q), element=element,
+                                  n=n, skew=skew, seg_kind='corner', loop=loop)
+        rows.append(row)
+        cn += 1
+        # straight run from this arc's exit to the next corner's tangent point
+        angn = np.arccos(np.clip(np.dot(dirs[q], dirs[(q + 1) % m]), -1.0, 1.0))
+        t_next = rhos[(q + 1) % m] * np.tan(angn / 2.0)
+        p_next = V[(q + 1) % m] - t_next * d_out
+        if np.linalg.norm(p_next - p_end) > 1e-9:
+            # T direction for the straight run: the arc's exit face is spanned by
+            # its local x and its local z (= d_in), so T must follow d_in
+            rows.append(make_straight_row_framed(
+                p_end, p_next, d_in, I, cn, W, T,
+                name='%s run %d' % (name, q), element=element, n=n, skew=skew,
+                seg_kind='run', loop=loop))
+            cn += 1
+    return rows
+
+
+def close_winding_arc(theta, I, z0, z1, geom, n, b=None, rho=None, element='',
+                      skew=False, cond_N_start=0, name=''):
+    '''Radial-return racetracks with arc-filleted corners -- the joint-matched
+    closure.
+
+    Each bar gets its own planar loop in the (r_hat(theta_i), z_hat) plane:
+    up the winding radius a, out to the return radius b, back down, and in
+    again.  All four bends lie in that one plane, which is what lets every face
+    mate; nothing comes inside r = a; and W stays azimuthal with T radial on the
+    body bars, so the conductor is oriented as in the chord closure.
+
+    The body field carries the usual [1 - (a/b)**n] return-radius factor, which
+    current_for_strength compensates when it is given b.
+    '''
+    a = geom.a
+    if b is None:
+        b = 2.0 * a
+    if b <= a:
+        raise ValueError('return radius b must exceed the winding radius a')
+    if rho is None:
+        rho = min(0.35 * (b - a), 0.35 * (z1 - z0))
+    theta = np.asarray(theta, float)
+    I = np.asarray(I, float)
+    rows = []
+    cn = cond_N_start
+    for i in range(len(theta)):
+        if np.isclose(I[i], 0.0):
+            continue
+        th = theta[i]
+        rhat = np.array([np.cos(th), np.sin(th), 0.0])
+        V = [a * rhat + np.array([0, 0, z0]),
+             a * rhat + np.array([0, 0, z1]),
+             b * rhat + np.array([0, 0, z1]),
+             b * rhat + np.array([0, 0, z0])]
+        rows_i = racetrack_arc_loop(V, rhat, rho, I[i], cn, geom.W, geom.T,
+                                    element=element, n=n, skew=skew, loop=i,
+                                    name='%s loop %d' % (name, i))
+        rows.extend(rows_i)
+        cn += len(rows_i)
+    return rows
+
+
+def element_endpoints(df):
+    '''Start and end points of every element, straights and arcs alike.'''
+    p0 = df[['x0', 'y0', 'z0']].values.astype(float)
+    if 'z1' in df.columns and not df['z1'].isna().all():
+        z1 = df['z1'].values.astype(float)
+    else:
+        th = np.radians(df['theta2'].values.astype(float))
+        z1 = df['z0'].values.astype(float) + df['length'].values.astype(float) * np.cos(th)
+    p1 = np.column_stack([df['x1'].values.astype(float),
+                          df['y1'].values.astype(float), z1])
+    return p0, p1
+
+
+def arc_points(row, n_seg=24):
+    '''Centreline polyline of an arc row, in global coordinates.'''
+    rho = float(row['R_curve'])
+    a = np.radians(float(row['dphi']))
+    R = Rotation.from_euler('zyz', np.array([row['Phi2'], row['theta2'],
+                                             row['psi2']])[::-1], degrees=True)
+    phis = np.linspace(0.0, a, n_seg + 1)
+    loc = np.column_stack([np.zeros_like(phis), -rho * np.cos(phis) + rho,
+                           rho * np.sin(phis)])
+    return np.array([row['x0'], row['y0'], row['z0']]) + R.apply(loc)
+
+
+def as_polylines(df, n_seg=24):
+    '''Every element as a list of (points, current), arcs discretised.
+
+    Used by the closure check and the thin-wire reference so they work on mixed
+    straight/arc geometry.
+    '''
+    out = []
+    has_kind = 'kind' in df.columns
+    p0, p1 = element_endpoints(df)
+    for k, (_, row) in enumerate(df.iterrows()):
+        if has_kind and row['kind'] == 'arc':
+            out.append((arc_points(row, n_seg), float(row['I'])))
+        else:
+            out.append((np.array([p0[k], p1[k]]), float(row['I'])))
+    return out
