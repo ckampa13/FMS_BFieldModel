@@ -26,15 +26,23 @@ from helicalc.tools import generate_cartesian_grid_df, add_points_for_J
 OUTDIR = os.path.join(helicalc_data, 'Bmaps', 'multipole', '')
 
 
-def make_region(name, geom):
-    '''Field-point DataFrame for a named region.'''
+def make_region(name, geom, dxy=0.020, dz=0.020):
+    '''Field-point DataFrame for a named region.
+
+    dxy, dz are the Cartesian grid steps for the 'map' region, in metres.
+    '''
     R, z0, z1 = geom.R_map, MAPPING_VOLUME['z0'], MAPPING_VOLUME['z1']
     if name == 'map':
-        # transverse-plane grid inside the mapping cylinder, over the full length
-        d = 0.010
-        g = {'X0': -R, 'Y0': -R, 'Z0': z0, 'dX': d, 'dY': d, 'dZ': 0.020,
-             'nX': int(2 * R / d) + 1, 'nY': int(2 * R / d) + 1,
-             'nZ': int((z1 - z0) / 0.020) + 1}
+        # Transverse grid inside the mapping cylinder, over the full length.
+        # Build it CENTRED on the axis: starting at -R with nX = int(2R/d)+1
+        # only lands symmetrically when d divides 2R, and silently does not
+        # otherwise -- a 25 mm step gives [-60, -35, -10, 15, 40] mm, which
+        # misses the axis, is asymmetric, and never reaches +R.
+        k = int(np.floor(R / dxy + 1e-9))
+        nz = int(round((z1 - z0) / dz)) + 1
+        g = {'X0': -k * dxy, 'Y0': -k * dxy, 'Z0': z0,
+             'dX': dxy, 'dY': dxy, 'dZ': dz,
+             'nX': 2 * k + 1, 'nY': 2 * k + 1, 'nZ': nz}
         df = generate_cartesian_grid_df(g, dec_round=6)
         return df[np.hypot(df.X, df.Y) <= R + 1e-9].reset_index(drop=True)
     if name == 'body':
@@ -85,6 +93,10 @@ def main(argv=None):
     p.add_argument('-d', '--dxyz_Jacobian', type=float, default=0.001)
     p.add_argument('-t', '--Testing', default='n',
                    help='small subset of field points? y/n(default)')
+    p.add_argument('--dxy', type=float, default=0.020,
+                   help="transverse grid step for region 'map' [m] (default 0.020)")
+    p.add_argument('--dz', type=float, default=0.020,
+                   help="axial grid step for region 'map' [m] (default 0.020)")
     p.add_argument('--aperture', type=float, default=0.150)
     p.add_argument('--winding-radius', default='0.090')
     p.add_argument('--per-element', action='store_true')
@@ -114,7 +126,7 @@ def main(argv=None):
             mine = order[args.Device::args.NDevices]
             bars = bars.iloc[np.sort(mine)].reset_index(drop=True)
 
-        df = make_region(args.Region, geom)
+        df = make_region(args.Region, geom, dxy=args.dxy, dz=args.dz)
         if args.Testing.strip() == 'y':
             df = df.iloc[:500].copy().reset_index(drop=True)
         suff = ''
