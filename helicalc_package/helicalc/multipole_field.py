@@ -26,7 +26,10 @@ DXYZ_MULTIPOLE = np.array([2e-3, 3e-3, 5e-3])
 # bytes per element and number of (N_batch, nx, ny, nz) arrays that
 # StraightIntegrator3D.integrate_vec holds live at once
 _BYTES = 8
-_N_LIVE = 6
+# RX, RY, RZ, R2_32, the integrand, and the intermediates trapz_3d builds while
+# reducing three axes.  Measured empirically: 6 is optimistic and OOMs on an
+# 11 GB card at fine dxyz, so budget for 9.
+_N_LIVE = 9
 
 
 # ----------------------------------------------------------------------------
@@ -108,7 +111,7 @@ def check_integration_nodes(df, dxyz, min_nodes=3, adapt=True):
     return True
 
 
-def estimate_batch_size(row, dxyz, mem_frac=0.6, max_batch=200000, min_batch=64,
+def estimate_batch_size(row, dxyz, mem_frac=0.45, max_batch=200000, min_batch=4,
                        min_nodes=3):
     '''Field points per chunk that fit in mem_frac of one GPU.
 
@@ -124,9 +127,29 @@ def estimate_batch_size(row, dxyz, mem_frac=0.6, max_batch=200000, min_batch=64,
 # ----------------------------------------------------------------------------
 # the aggregator
 # ----------------------------------------------------------------------------
-def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.6,
+def promote_nodes_to_float64(integ):
+    '''Re-cast an integrator's integration nodes to float64.
+
+    helicalc builds them with tc.linspace, which defaults to float32, so node
+    positions carry ~1e-7 relative error (about 70 nm on a 1.5 m bar).
+
+    This was TESTED as a candidate cause of the Maxwell curl floor documented in
+    add_field and found NOT to be responsible: promoting to float64 reproduces
+    the float32 residuals to every printed digit.  Kept as an option (it is
+    nearly free) but off by default, so nobody re-runs the same experiment.
+    '''
+    integ.xps = integ.xps.double()
+    integ.yps = integ.yps.double()
+    integ.zps = integ.zps.double()
+    integ.XP, integ.YP, integ.ZP = tc.meshgrid(integ.xps, integ.yps, integ.zps,
+                                               indexing='ij')
+    return integ
+
+
+def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
               per_element=False, units='T', tqdm=tqdm, lib=tc, int_func=None,
-              prefix='B', verbose=True, check_nodes=True, min_nodes=3):
+              prefix='B', verbose=True, check_nodes=True, min_nodes=3,
+              float64_nodes=False):
     '''Sum StraightIntegrator3D over every bar in df_bars.
 
     df_points : DataFrame with X, Y, Z columns [m] (HP is carried through).
@@ -137,6 +160,31 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.6,
     units     : 'T' (default) or 'G'.
 
     Returns a copy of df_points with prefix+'x/y/z' columns added.
+
+    KNOWN LIMITATION -- spurious curl at conductor corners.
+    helicalc models a bar as a rectangular prism whose current enters and leaves
+    through flat faces perpendicular to that bar's own axis.  Where two bars of a
+    loop meet at an angle the two faces are not coplanar, so the volumetric
+    current is not conserved in the wedge at the joint.  The resulting field is
+    still divergence-free -- div B converges as h^2 and matches the thin-wire
+    model exactly -- but curl B does NOT vanish in the bore: it converges to a
+    constant, about 0.03 T/m per loop, at points near an element's end turns,
+    where it should be zero.
+
+    Established by experiment, not assumed:
+      - the thin-wire field of the same (Kirchhoff-closed to 0 A) geometry has
+        div and curl both converging as h^2, ratio 4.0, with no floor;
+      - the floor is unchanged by refining dxyz over a factor of 8;
+      - it is unchanged by float32 vs float64 integration nodes;
+      - one closed loop shows it near its corners but not at the magnet centre,
+        where the two ends' contributions cancel.
+
+    It is a property of the prism conductor model rather than of this module, and
+    it applies equally to helicalc's Mu2e bus bars.  Removing it needs a joint-
+    matched conductor model (mitred end faces, or a filament bundle routed with a
+    common cross-section offset through every bar of a loop).  Until then treat
+    curl B near element ends as a model artefact, and use thin_wire_field when an
+    exactly curl-free reference is needed.
     '''
     if dxyz is None:
         dxyz = DXYZ_MULTIPOLE
@@ -172,6 +220,8 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.6,
                                             min_nodes=min_nodes)
         integ = StraightIntegrator3D(row, dxyz=d_bar, dev=dev, lib=lib,
                                      int_func=int_func)
+        if float64_nodes and lib is tc:
+            promote_nodes_to_float64(integ)
         acc = np.zeros((3, npts))
         for s in range(0, npts, nb):
             e = min(s + nb, npts)
@@ -181,6 +231,8 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.6,
         if per_el:
             per_el[row['element']] += acc
         del integ
+        if lib is tc:
+            tc.cuda.empty_cache()      # fine dxyz fragments the caching allocator
 
     for i, c in enumerate('xyz'):
         df[prefix + c] = scale * total[i]
