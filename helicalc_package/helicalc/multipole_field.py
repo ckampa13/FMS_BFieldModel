@@ -179,12 +179,35 @@ def add_field(df_points, df_bars, dxyz=None, dev=0, N_batch=None, mem_frac=0.45,
       - one closed loop shows it near its corners but not at the magnet centre,
         where the two ends' contributions cancel.
 
-    It is a property of the prism conductor model rather than of this module, and
-    it applies equally to helicalc's Mu2e bus bars.  Removing it needs a joint-
-    matched conductor model (mitred end faces, or a filament bundle routed with a
-    common cross-section offset through every bar of a loop).  Until then treat
-    curl B near element ends as a model artefact, and use thin_wire_field when an
-    exactly curl-free reference is needed.
+    Confirmed by construction: an exactly-closed bundle of translated closed
+    filaments with the SAME 8 x 15 mm cross-section is curl-free to 3e-4 G at the
+    same probe, while helicalc's prism model of that conductor gives 0.36 G.  So
+    the finite cross-section is not the problem -- the unmated end faces are.
+
+    FIX (verified): put an ARC element at each corner, with the adjoining straight
+    bars' cross-section oriented so their faces mate.  An arc's end faces are
+    perpendicular to its local tangent, so they mate exactly with a straight bar
+    carrying the same Euler angles; helicalc's arc integrand already carries the
+    (R - y') Jacobian, so the current stays uniform and divergence-free through
+    the bend.  On a test racetrack this cut the residual from 0.504 G to 0.008 G
+    at 50 mm and from 0.877 G to 0.033 G at 30 mm -- 27x to 67x, and well under
+    the 0.3 G noise -- at the same winding radius and cross-section.
+
+    The mating is the fiddly part: helicalc's arc bends in its local y-z plane, so
+    T (not W) must lie in the bend plane, and psi2 on the straight bars must be set
+    to match rather than left to psi_mode='radial'/'normal'.  Getting that wrong
+    silently reintroduces the artefact at full size -- it did here on the first try.
+
+    Second mitigation (verified, independent): moving the winding radius out.
+    Measured at r = 50 mm, a = 90 -> 200 mm takes the MQ end from 9.65 to 1.03 G
+    and every other element below 0.32 G; a = 300 mm reaches 0.34 G at the quad.
+    It costs current (~a^n) and lengthens the fringe, which is the physics under
+    test, so the arc corners are the better fix.
+
+    Rejected by measurement: subdividing bars into n x n sub-bars (no effect --
+    sub-bars in the same local frame tile the identical prism), shrinking the
+    cross-section (non-monotonic), and rounding corners with extra STRAIGHT
+    segments (slightly worse -- more joints, more wedges).
     '''
     if dxyz is None:
         dxyz = DXYZ_MULTIPOLE
