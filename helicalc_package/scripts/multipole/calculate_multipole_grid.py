@@ -26,12 +26,46 @@ from helicalc.tools import generate_cartesian_grid_df, add_points_for_J
 OUTDIR = os.path.join(helicalc_data, 'Bmaps', 'multipole', '')
 
 
-def make_region(name, geom, dxy=0.020, dz=0.020):
+def make_region(name, geom, dxy=0.020, dz=0.020, radii=None, nphi=32,
+                dedupe_axis=True, offset=False):
     '''Field-point DataFrame for a named region.
 
-    dxy, dz are the Cartesian grid steps for the 'map' region, in metres.
+    dxy, dz         Cartesian grid steps for the 'map' region [m]
+    radii, nphi, dz probe radii, azimuths per revolution and z step for the
+                    'measurement' region
+    offset          shift the 'map' grid by half a step in z, so that a test
+                    sample does not sit on the same z planes as the measurement
+                    set.  Without it, the propeller's phi = 0/90/180/270 arms at
+                    r = 0/20/40/60 mm land exactly on a 20 mm cartesian grid at
+                    the same z, and 45% of the test points are locations the fit
+                    was trained on.
+    dedupe_axis     an on-axis probe does not move as the propeller turns, so
+                    its nphi azimuths are all the same point.  True keeps one
+                    row per z for it (the truth field there is identical);
+                    downstream, replicate that row nphi times if you want nphi
+                    independent noisy readings.  False emits all nphi.
     '''
     R, z0, z1 = geom.R_map, MAPPING_VOLUME['z0'], MAPPING_VOLUME['z1']
+    if name == 'measurement':
+        # Propeller sampling (handoff sec 6): probes at fixed radii on a rotating
+        # arm, stepped along z.  nphi = 32 matters -- with 16 the n = 10 content
+        # aliases onto n = 6, and this assembly carries both.
+        if radii is None:
+            radii = [0.0, 0.020, 0.040, 0.060]
+        radii = [r for r in radii if r <= R + 1e-9]
+        zs = np.arange(z0, z1 + 1e-9, dz)
+        ph = 2 * np.pi * np.arange(nphi) / nphi
+        frames = []
+        for r in radii:
+            use = ph[:1] if (dedupe_axis and r <= 1e-12) else ph
+            for z in zs:
+                frames.append(pd.DataFrame({
+                    'X': r * np.cos(use), 'Y': r * np.sin(use),
+                    'Z': np.full(len(use), z),
+                    'HP': 'r%03.0fmm' % (1e3 * r),
+                    'phi': use,
+                    'n_rep': (nphi if (dedupe_axis and r <= 1e-12) else 1)}))
+        return pd.concat(frames, ignore_index=True)
     if name == 'map':
         # Transverse grid inside the mapping cylinder, over the full length.
         # Build it CENTRED on the axis: starting at -R with nX = int(2R/d)+1
@@ -39,8 +73,9 @@ def make_region(name, geom, dxy=0.020, dz=0.020):
         # otherwise -- a 25 mm step gives [-60, -35, -10, 15, 40] mm, which
         # misses the axis, is asymmetric, and never reaches +R.
         k = int(np.floor(R / dxy + 1e-9))
-        nz = int(round((z1 - z0) / dz)) + 1
-        g = {'X0': -k * dxy, 'Y0': -k * dxy, 'Z0': z0,
+        zoff = 0.5 * dz if offset else 0.0
+        nz = int(round((z1 - z0 - zoff) / dz)) + 1
+        g = {'X0': -k * dxy, 'Y0': -k * dxy, 'Z0': z0 + zoff,
              'dX': dxy, 'dY': dxy, 'dZ': dz,
              'nX': 2 * k + 1, 'nY': 2 * k + 1, 'nZ': nz}
         df = generate_cartesian_grid_df(g, dec_round=6)
@@ -73,14 +108,15 @@ def make_region(name, geom, dxy=0.020, dz=0.020):
         pp = 2 * np.pi * rng.random(n)
         return pd.DataFrame({'X': rr * np.cos(pp), 'Y': rr * np.sin(pp),
                              'Z': rng.uniform(z0 + 0.05, z1 - 0.05, n)})
-    raise ValueError("region must be one of: map, body, axis, maxwell")
+    raise ValueError("region must be one of: map, measurement, body, axis, "
+                     "maxwell")
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('-r', '--Region', default='body',
-                   help='map | body (default) | axis | maxwell')
+                   help='map | measurement | body (default) | axis | maxwell')
     p.add_argument('-D', '--Device', type=int, default=0, help='GPU index')
     p.add_argument('-N', '--NDevices', type=int, default=1,
                    help='total GPUs the bar list is split across')
@@ -96,7 +132,16 @@ def main(argv=None):
     p.add_argument('--dxy', type=float, default=0.020,
                    help="transverse grid step for region 'map' [m] (default 0.020)")
     p.add_argument('--dz', type=float, default=0.020,
-                   help="axial grid step for region 'map' [m] (default 0.020)")
+                   help="axial step for regions 'map' and 'measurement' [m]")
+    p.add_argument('--radii', default='0,20,40,60',
+                   help="probe radii in MM for region 'measurement' (default 0,20,40,60)")
+    p.add_argument('--nphi', type=int, default=32,
+                   help="azimuths per revolution for 'measurement' (default 32)")
+    p.add_argument('--offset-map', action='store_true',
+                   help="shift region 'map' by half a z step so the test sample "
+                        'does not reuse measurement locations')
+    p.add_argument('--keep-axis-copies', action='store_true',
+                   help='emit all nphi rows for an on-axis probe instead of one')
     p.add_argument('--aperture', type=float, default=0.150)
     p.add_argument('--winding-radius', default='0.090')
     p.add_argument('--per-element', action='store_true')
@@ -126,7 +171,11 @@ def main(argv=None):
             mine = order[args.Device::args.NDevices]
             bars = bars.iloc[np.sort(mine)].reset_index(drop=True)
 
-        df = make_region(args.Region, geom, dxy=args.dxy, dz=args.dz)
+        radii = [float(v) / 1e3 for v in args.radii.split(',') if v.strip()]
+        df = make_region(args.Region, geom, dxy=args.dxy, dz=args.dz,
+                         radii=radii, nphi=args.nphi,
+                         dedupe_axis=not args.keep_axis_copies,
+                         offset=args.offset_map)
         if args.Testing.strip() == 'y':
             df = df.iloc[:500].copy().reset_index(drop=True)
         suff = ''

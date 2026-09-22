@@ -1590,3 +1590,69 @@ def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
             raise ValueError('saddle loop %d does not close (gap %.2e m)'
                              % (loop_id, np.linalg.norm(cursor - ri - zb * zhat)))
     return rows
+
+
+# ----------------------------------------------------------------------------
+# harmonic rings ("rotating coil")
+# ----------------------------------------------------------------------------
+def ring_points(R_ref, z, M=256, phi0=0.0):
+    '''M points evenly spaced on the circle r = R_ref at height z.
+
+    M sets the highest order the ring can resolve: an M-point FFT separates
+    orders up to M/2 - 1, and a multipole of order n aliases onto |n - M| and
+    |n + M|.  256 points is ample here (n <= 127) and cheap; do not drop below
+    about 4n for the highest order you care about.
+    '''
+    ph = phi0 + 2 * np.pi * np.arange(M) / M
+    return np.column_stack([R_ref * np.cos(ph), R_ref * np.sin(ph),
+                            np.full(M, z)]), ph
+
+
+def make_ring_grid(zs, R_ref, M=256, labels=None):
+    '''DataFrame of ring points at each z, tagged so they can be regrouped.
+
+    The tag goes in HP, which add_field and helicalc's save_grid_calc both carry
+    through untouched.
+    '''
+    frames = []
+    for i, z in enumerate(zs):
+        P, _ = ring_points(R_ref, z, M)
+        lab = labels[i] if labels is not None else 'ring%05d' % i
+        frames.append(pd.DataFrame({'X': P[:, 0], 'Y': P[:, 1], 'Z': P[:, 2],
+                                    'HP': lab}))
+    return pd.concat(frames, ignore_index=True)
+
+
+def harmonics_dataframe(df, n_max=20, M=None, prefix='B', by='HP'):
+    '''Tidy b_n / a_n table from a DataFrame of ring points with field columns.
+
+    df must hold the ring points (X, Y, Z), a grouping column (`by`), and the
+    field as prefix+'x/y'.  Returns one row per (ring, order) with
+
+        B_n, A_n      the coefficients in tesla at the ring radius
+        b_n, a_n      the same in units, 1e4 x coefficient / |main|
+        n_main        the order carrying the largest |coefficient| on that ring
+
+    Rings are regrouped by `by` and sorted by azimuth before the FFT, so the
+    row order in the input does not matter -- which it otherwise would, since
+    the GPU workers write points back in chunk order.
+    '''
+    rows = []
+    for lab, sub in df.groupby(by, sort=False):
+        ph = np.arctan2(sub['Y'].values, sub['X'].values) % (2 * np.pi)
+        o = np.argsort(ph)
+        Bx = sub[prefix + 'x'].values[o]
+        By = sub[prefix + 'y'].values[o]
+        R = float(np.hypot(sub['X'].values[0], sub['Y'].values[0]))
+        z = float(sub['Z'].values[0])
+        h = harmonics_from_field(Bx, By, ph[o], n_max=n_max)
+        amp = {m: float(np.hypot(*h[m])) for m in h}
+        n_main = max(amp, key=amp.get)
+        main = amp[n_main] if amp[n_main] > 0 else np.nan
+        for m in sorted(h):
+            rows.append(dict(ring=lab, z=z, R_ref=R, n=m,
+                             B_n=h[m][0], A_n=h[m][1],
+                             b_n=1e4 * h[m][0] / main,
+                             a_n=1e4 * h[m][1] / main,
+                             n_main=n_main))
+    return pd.DataFrame(rows)
