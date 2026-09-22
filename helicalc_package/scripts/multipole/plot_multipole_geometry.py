@@ -45,17 +45,78 @@ def is_axial(row, p0, p1):
 
 
 # ---------------------------------------------------------------- 3D (plotly)
-def plot_3d(df, geom, path, title, n_seg=20, show_cylinder=True):
+def pole_labels(df):
+    """Label each conductor by which POLE its axial leg sits in.
+
+    Poles are found from the current sign itself -- sort the axial bars by
+    azimuth and cut at every sign change -- so there is no sector-binning
+    convention to get wrong.  That matters: an earlier version binned by fixed
+    sector boundaries and miscounted, because where those boundaries fall
+    relative to the bar grid is arbitrary (and moves for skew windings).
+
+    A 2n-pole gives 2n polarity runs.  Each saddle TURN spans two of them (up in
+    one pole, down in the next), so the turns cluster into n visible bundles --
+    n bundles and 2n poles are the same winding, counted differently.
+    """
+    if 'seg_kind' not in df.columns or not len(df):
+        return None
+    ax = df[df['seg_kind'] == 'axial']
+    if not len(ax):
+        return None
+    p0, p1 = element_endpoints(ax)
+    th = np.arctan2(p0[:, 1], p0[:, 0]) % (2 * np.pi)
+    flow = np.sign(ax['I'].values) * np.sign((p1 - p0)[:, 2])
+    order = np.argsort(th)
+    pole_of_idx = {}
+    pole = 0
+    prev = flow[order[0]]
+    for k in order:
+        if flow[k] != prev:
+            pole += 1
+            prev = flow[k]
+        pole_of_idx[ax.index[k]] = pole
+    npole = pole + 1
+    # the walk starts partway through a run, so the last run wraps around into
+    # the first one; merge them or every winding reports one pole too many
+    if npole > 1 and flow[order[0]] == flow[order[-1]]:
+        last = npole - 1
+        for idx, pv in pole_of_idx.items():
+            if pv == last:
+                pole_of_idx[idx] = 0
+        npole -= 1
+    lab = np.empty(len(df), dtype=object)
+    for i, (idx, row) in enumerate(df.iterrows()):
+        if row['seg_kind'] == 'axial':
+            lab[i] = 'pole %d (%s)' % (pole_of_idx[idx],
+                                       '+z' if np.sign(row['I']) *
+                                       np.sign(element_endpoints(df.loc[[idx]])[1][0][2]
+                                               - element_endpoints(df.loc[[idx]])[0][0][2])
+                                       > 0 else '-z')
+        else:
+            lab[i] = 'end turns'
+    return lab, npole
+
+
+def plot_3d(df, geom, path, title, n_seg=20, show_cylinder=True, by_group=False):
     try:
         import plotly.graph_objects as go
     except ImportError:
         print('  plotly not available, skipping the 3D view')
         return None
-    colors = element_colors(df)
     polys = as_polylines(df, n_seg=n_seg)
+    key = None
+    if by_group:
+        r = pole_labels(df)
+        if r is not None:
+            key, npole = r
+            title = '%s  --  %d poles' % (title, npole)
+    if key is None:
+        key = df['element'].values
+    names = list(dict.fromkeys(key))
+    colors = {e: PALETTE[i % len(PALETTE)] for i, e in enumerate(names)}
     fig = go.Figure()
-    for el in dict.fromkeys(df['element']):
-        idx = np.where((df['element'] == el).values)[0]
+    for el in names:
+        idx = np.where(key == el)[0]
         xs, ys, zs = [], [], []
         for k in idx:
             pts = polys[k][0]
@@ -78,9 +139,17 @@ def plot_3d(df, geom, path, title, n_seg=20, show_cylinder=True):
     # Beam axis is the scene's z, which plotly draws VERTICALLY by default.
     # up = scene y puts the transverse vertical axis up the screen, and an eye
     # placed essentially along scene x leaves the beam axis running left-right.
+    #
+    # The SIGN of eye.x sets which way the beam axis runs.  screen_right is
+    # normalize(cross(center - eye, up)); with eye.x > 0 that comes out as
+    # (0.06, 0, -1), i.e. z increasing to the LEFT.  eye.x < 0 flips it to
+    # (0.06, 0, +1), z increasing to the right, which is what you want.
+    #
+    # |eye| sets the zoom: plotly's default is 2.17, and the 3.76 here pulls back
+    # far enough that the whole assembly is in frame when the page opens.
     camera = dict(up=dict(x=0, y=1, z=0),
                   center=dict(x=0, y=0, z=0),
-                  eye=dict(x=1.9, y=0.55, z=0.12))
+                  eye=dict(x=-3.6, y=1.05, z=0.30))
     fig.update_layout(title=title,
                       scene=dict(xaxis_title='x [m]  (transverse)',
                                  yaxis_title='y [m]  (up)',
@@ -513,6 +582,9 @@ def main(argv=None):
     p.add_argument('--winding-radius', default='0.090')
     p.add_argument('--out-dir', default=None,
                    help='default: <helicalc_data>/Bmaps/multipole/plots/')
+    p.add_argument('--by-group', action='store_true',
+                   help='colour the 3D view by POLE instead of element, poles '
+                        'found from the current sign (use with -e)')
     p.add_argument('--anim', action='store_true',
                    help='also write a rotating 3D animation (no WebGL needed)')
     p.add_argument('--no-field', action='store_true',
@@ -534,7 +606,8 @@ def main(argv=None):
     made = []
     r = plot_3d(sub, geom, base + tag + '_conductors_3d.html',
                 'Multipole assembly conductors%s' % ('' if args.element is None
-                                                     else ' -- ' + args.element))
+                                                     else ' -- ' + args.element),
+                by_group=args.by_group)
     if r:
         made += [x for x in r if x]
     made.append(plot_3d_static(sub, geom, base + tag + '_conductors_3d.png',
