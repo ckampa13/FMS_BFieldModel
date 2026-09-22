@@ -47,7 +47,7 @@ def build_parser():
                    help='min conductor radius [m]; default R_aper')
     p.add_argument('--N-target', type=int, default=32,
                    help='bars per winding before rounding to a multiple of 4n')
-    p.add_argument('--closure', default='chord', choices=['chord', 'radial', 'arc'],
+    p.add_argument('--closure', default='chord', choices=['chord', 'radial', 'arc', 'saddle'],
                    help='winding closure (default chord)')
     p.add_argument('--return-radius', type=opt_float, default=None,
                    help="return radius b [m], required for --closure radial")

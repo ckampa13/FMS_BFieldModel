@@ -366,6 +366,18 @@ def calibrate_winding(df, n, skew, zc, geom, B_target, M=256):
     return out, scale
 
 
+def squared_geom(geom):
+    """Same conductor area, square cross-section.
+
+    Saddle closure needs W == T: at the corner/middle-arc junction the
+    cross-section axes swap, so the faces coincide only for a square.
+    """
+    if np.isclose(geom.W, geom.T):
+        return geom
+    side = float(np.sqrt(geom.W * geom.T))
+    return geom.with_(W=side, T=side)
+
+
 def default_return_radius(closure, geom, b=None):
     """Return radius for the closures that need one.
 
@@ -457,8 +469,12 @@ def close_winding(theta, I, z0, z1, geom, n, closure='chord', b=None,
     elif closure == 'arc':
         rows = close_winding_arc(theta, I, z0, z1, geom, n, b=b, element=element,
                                  skew=skew, cond_N_start=cond_N_start, name=name)
+    elif closure == 'saddle':
+        rows = close_winding_saddle(theta, I, z0, z1, geom, n, element=element,
+                                    skew=skew, cond_N_start=cond_N_start,
+                                    name=name)
     else:
-        raise ValueError("closure must be 'chord', 'radial' or 'arc'")
+        raise ValueError("closure must be 'chord', 'radial', 'arc' or 'saddle'")
     return rows
 
 
@@ -471,6 +487,8 @@ def make_cosn_winding(n, L, zc, B_ref=None, I0=None, skew=False, geom=None,
     Returns a DataFrame of straight bars in the Mu2e schema.
     '''
     g = _resolve_geom(geom, geom_overrides)
+    if closure == 'saddle':
+        g = squared_geom(g)
     if N is None:
         N = bars_per_pole(n, g.N_target)
     if (B_ref is None) == (I0 is None):
@@ -510,11 +528,16 @@ def bar_endpoints(df):
     return p0, p1
 
 
-def check_closure(df, tol=1e-9, decimals=9):
+def check_closure(df, tol=1e-9, decimals=6):
     '''Kirchhoff check: net current into every node must vanish.
 
     Returns (ok, worst_residual, df_nodes).  An open winding gives a field that
     is not divergence-free, so this must pass before any field calculation.
+
+    Nodes are binned by rounding to `decimals` places in metres; 6 (a micron) is
+    far below any real conductor spacing and far above the float noise between a
+    computed arc endpoint and the next element's start.  Binning at 9 places
+    splits some of those coincident pairs and reports a closed winding as open.
     '''
     p0, p1 = element_endpoints(df)
     I = df['I'].values.astype(float)
@@ -781,6 +804,8 @@ def make_sector_winding(n, L, zc, blocks, B_ref=None, I0=None, skew=False,
         N = bars_per_pole(n, g.N_target)
     if (B_ref is None) == (I0 is None):
         raise ValueError('give exactly one of B_ref or I0')
+    if closure == 'saddle':
+        g = squared_geom(g)
     half = sector_half_width(n)
     for lo, hi in blocks:
         if lo < -1e-9 or hi > half + 1e-9 or hi <= lo:
@@ -1214,7 +1239,8 @@ def make_straight_row_framed(p0, p1, ey, I, cond_N, W, T, name='', element='',
 
 
 def make_arc_row(p_start, d_in, d_out, rho, I, cond_N, W, T, name='',
-                 element='', n=0, skew=False, seg_kind='corner', loop=-1):
+                 element='', n=0, skew=False, seg_kind='corner', loop=-1,
+                 toward=None):
     '''Circular-arc corner turning the current from d_in to d_out.
 
     p_start is the tangent point where the incoming straight bar ends.  The arc
@@ -1230,10 +1256,21 @@ def make_arc_row(p_start, d_in, d_out, rho, I, cond_N, W, T, name='',
     dphi = np.degrees(np.arccos(cosang))
     if dphi < 1e-9:
         raise ValueError('arc corner with no turn')
-    # centre of curvature lies in the turn plane, perpendicular to d_in,
-    # on the side d_out turns toward
-    toward = d_out - cosang * d_in
-    toward /= np.linalg.norm(toward)
+    if toward is None:
+        # centre of curvature lies in the turn plane, perpendicular to d_in,
+        # on the side d_out turns toward
+        toward = d_out - cosang * d_in
+        nrm = np.linalg.norm(toward)
+        if nrm < 1e-12:
+            # exact 180 degree turn: d_out tells you nothing about which way the
+            # arc goes, so the caller has to supply the centre direction
+            raise ValueError('180 degree arc is ambiguous; pass `toward` '
+                             '(the direction from p_start to the centre)')
+        toward = toward / nrm
+    else:
+        toward = np.asarray(toward, float)
+        toward = toward - np.dot(toward, d_in) * d_in
+        toward /= np.linalg.norm(toward)
     ex, ey, ez = _frame_for(d_in, toward)
     Phi2, theta2, psi2 = euler_from_frame(ex, ey, ez)
     p_start = np.asarray(p_start, float)
@@ -1398,3 +1435,113 @@ def as_polylines(df, n_seg=24):
         else:
             out.append((np.array([p0[k], p1[k]]), float(row['I'])))
     return out
+
+
+# ----------------------------------------------------------------------------
+# saddle closure: cos(n.theta) topology WITH joint-matched arc corners
+# ----------------------------------------------------------------------------
+# This is the closure to use.  It keeps the chord closure's physics -- a real
+# cos(n.theta) saddle, axial conductors on the r = a shell, end turns wrapping
+# over the cylinder, loop magnetic moment radial -- while making every joint
+# mate, so the spurious curl of the all-straight model is gone.
+#
+# Each end turn is three arcs: a corner fillet turning z_hat into phi_hat in the
+# cylinder's tangent plane, a middle arc lying in z = const, and a mirrored
+# corner fillet turning back into -z_hat.
+#
+# The middle arc is NOT concentric with the beam axis.  Requiring it to be
+# tangent to the corner fillets puts its centre on the pair's bisector at
+# t = rho / sin(dtheta/2), and the arc then bulges AWAY from the bore: its
+# closest approach is ~91 mm for a 90 mm winding radius, at every pole order
+# including the dipole.  (Assuming a concentric end arc is what made this look
+# impossible at first -- it is not.)
+#
+# One constraint: at the corner/middle junction the cross-section axes swap
+# (the corner leaves with W radial and T axial, the middle arc wants W axial and
+# T radial), so the faces coincide only for a SQUARE conductor.  build_assembly
+# squares the cross-section at constant area when this closure is selected.
+
+def saddle_end_geometry(th_i, th_j, a, rho):
+    '''Middle-arc centre, radius and the two tangent points of one end turn.'''
+    dth = (th_j - th_i) % (2 * np.pi)
+    u = lambda t: np.array([np.cos(t), np.sin(t), 0.0])      # r_hat
+    v = lambda t: np.array([-np.sin(t), np.cos(t), 0.0])     # phi_hat
+    th_m = th_i + 0.5 * dth
+    t = rho / np.sin(0.5 * dth)
+    C = t * u(th_m)
+    P_i = a * u(th_i) + rho * v(th_i)
+    P_j = a * u(th_j) - rho * v(th_j)
+    R_c = float(np.linalg.norm(P_i - C))
+    return C, R_c, P_i, P_j, u, v, dth
+
+
+def close_winding_saddle(theta, I, z0, z1, geom, n, rho=None, element='',
+                         skew=False, cond_N_start=0, name='', atol=1e-9):
+    '''cos(n.theta) saddle winding with arc-filleted, face-matched joints.
+
+    Eight elements per loop: two axial bars and two three-arc end turns.  The
+    loop is verified closed to `atol` as it is built.
+    '''
+    a = geom.a
+    if not np.isclose(geom.W, geom.T):
+        raise ValueError('saddle closure needs a square conductor (W == T); '
+                         'got W=%.4f, T=%.4f' % (geom.W, geom.T))
+    if rho is None:
+        rho = min(0.18 * a, 0.30 * (z1 - z0))
+    theta = np.asarray(theta, float)
+    I = np.asarray(I, float)
+    N = len(theta)
+    zhat = np.array([0.0, 0.0, 1.0])
+    rows = []
+    cn = cond_N_start
+    for loop_id, (i, j) in enumerate(pair_bars(n, N)):
+        if np.isclose(I[i], 0.0):
+            continue
+        cur = I[i]
+        th_i, th_j = theta[i], theta[j]
+        C, R_c, P_i, P_j, u, v, dth = saddle_end_geometry(th_i, th_j, a, rho)
+        ri, rj = a * u(th_i), a * u(th_j)
+        pi_, pj_ = v(th_i), v(th_j)
+        zb, zt = z0 + rho, z1 - rho
+        if zt <= zb:
+            raise ValueError('element too short for fillet radius rho=%.4f' % rho)
+        # (start, kind, payload) walked in current order
+        tw_i = C - P_i        # P_i -> middle-arc centre, in the z = const plane
+        tw_j = C - P_j
+        steps = [
+            ('s', ri + zb * zhat, ri + zt * zhat, pi_),
+            ('a', ri + zt * zhat, zhat, pi_, rho, None),
+            ('a', P_i + z1 * zhat, pi_, pj_, R_c, tw_i),
+            ('a', P_j + z1 * zhat, pj_, -zhat, rho, None),
+            ('s', rj + zt * zhat, rj + zb * zhat, pj_),
+            ('a', rj + zb * zhat, -zhat, -pj_, rho, None),
+            ('a', P_j + z0 * zhat, -pj_, -pi_, R_c, tw_j),
+            ('a', P_i + z0 * zhat, -pi_, zhat, rho, None),
+        ]
+        cursor = ri + zb * zhat
+        for st in steps:
+            if not np.allclose(st[1], cursor, atol=atol):
+                raise ValueError('saddle loop %d is discontinuous at %s (gap %.2e m)'
+                                 % (loop_id, st[0], np.linalg.norm(st[1] - cursor)))
+            if st[0] == 's':
+                _, p0, p1, ey = st
+                rows.append(make_straight_row_framed(
+                    p0, p1, ey, cur, cn, geom.W, geom.T,
+                    name='%s bar %d' % (name, loop_id), element=element, n=n,
+                    skew=skew, seg_kind='axial', loop=loop_id))
+                cursor = np.asarray(p1, float)
+            else:
+                _, p0, d_in, d_out, rr, tw = st
+                row, p_end = make_arc_row(p0, d_in, d_out, rr, cur, cn,
+                                          geom.W, geom.T,
+                                          name='%s end %d' % (name, loop_id),
+                                          element=element, n=n, skew=skew,
+                                          seg_kind='corner' if rr == rho else 'endarc',
+                                          loop=loop_id, toward=tw)
+                rows.append(row)
+                cursor = p_end
+            cn += 1
+        if not np.allclose(cursor, ri + zb * zhat, atol=atol):
+            raise ValueError('saddle loop %d does not close (gap %.2e m)'
+                             % (loop_id, np.linalg.norm(cursor - ri - zb * zhat)))
+    return rows

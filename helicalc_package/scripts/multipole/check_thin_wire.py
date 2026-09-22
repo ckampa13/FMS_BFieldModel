@@ -47,7 +47,7 @@ def main(argv=None):
     p.add_argument('--winding-radius', default='0.090')
     p.add_argument('--N-target', type=int, default=32)
     p.add_argument('--closure', default='chord',
-                   choices=['chord', 'radial', 'arc'])
+                   choices=['chord', 'radial', 'arc', 'saddle'])
     args = p.parse_args(argv)
     a = None if str(args.winding_radius).lower() in ('auto', 'none', '') \
         else float(args.winding_radius)

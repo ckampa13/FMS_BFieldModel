@@ -54,6 +54,12 @@ def main(argv=None):
     p.add_argument('--skip', default='', help='comma list: body,length,maxwell,overlap')
     p.add_argument('--dz', type=float, default=0.010,
                    help='z step for the length profiles [m]')
+    p.add_argument('--dxyz-scale', type=float, default=1.0,
+                   help='coarsen the integration step for the body/length/overlap '
+                        'sections, which need field VALUES not derivatives. The '
+                        'arc default is set for curl accuracy and is far finer '
+                        'than those sections need, so scale 4 runs them ~64x '
+                        'faster per arc. The Maxwell section ignores this.')
     args = p.parse_args(argv)
     skip = {s.strip() for s in args.skip.split(',') if s.strip()}
     a = None if str(args.winding_radius).lower() in ('auto', 'none', '') \
@@ -61,6 +67,9 @@ def main(argv=None):
     geom = MultipoleGeom(aperture=args.aperture, a=a)
     bars = load_assembly_csv(args.Geom)
     dev = args.Device
+    from helicalc.multipole_field import DXYZ_MULTIPOLE, DXYZ_MULTIPOLE_ARC
+    sc = args.dxyz_scale
+    fast = dict(dxyz=DXYZ_MULTIPOLE * sc, dxyz_arc=DXYZ_MULTIPOLE_ARC * sc)
     M = 256
     results = {}
 
@@ -81,7 +90,7 @@ def main(argv=None):
         # 2.05 T, 2.2 m dipole has a magnetic moment of ~1e5 A m^2, so its
         # fringe is tens of gauss at the correctors a metre downstream.
         out = add_field(allpts, bars, dev=dev, verbose=False, tqdm=None,
-                        per_element=True)
+                        per_element=True, **fast)
         Bt = thin_wire_field(bars, allpts[['X', 'Y', 'Z']].values)
 
         def el_field(sub, name):
@@ -156,8 +165,8 @@ def main(argv=None):
                 d, ph = circle_df(geom.R_ref, z, 32, '%s@%.4f' % (spec['name'], z))
                 frames.append(d)
         allpts = pd.concat(frames, ignore_index=True)
-        print('  profiling %d points ...' % len(allpts))
-        out = add_field(allpts, bars, dev=dev, verbose=False, tqdm=None)
+        print('  profiling %d points (dxyz x%.3g) ...' % (len(allpts), sc))
+        out = add_field(allpts, bars, dev=dev, verbose=False, tqdm=None, **fast)
         ph32 = 2 * np.pi * np.arange(32) / 32
 
         print('  %-6s %-9s %-11s %-11s %-8s %-8s'
@@ -246,7 +255,7 @@ def main(argv=None):
             frames.append(d)
             pairs.append((A, Bn, zm))
         allpts = pd.concat(frames, ignore_index=True)
-        out = add_field(allpts, bars, dev=dev, verbose=False, tqdm=None)
+        out = add_field(allpts, bars, dev=dev, verbose=False, tqdm=None, **fast)
         ph64 = 2 * np.pi * np.arange(64) / 64
         print('  %-14s %-8s %-12s %-12s'
               % ('gap', 'z_mid', 'A at mid/A0', 'B at mid/B0'))
