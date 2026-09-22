@@ -119,20 +119,22 @@ def plot_cross_section(df, geom, path, element=None):
 def plot_layout(df, geom, path):
     fig, ax = plt.subplots(figsize=(11, 3.4))
     colors = element_colors(df)
+    # two rows so neighbouring elements do not overlap; labels always sit above
+    # their own bar, which keeps them clear of the axis
     for i, spec in enumerate(ASSEMBLY_ELEMENTS):
-        y = 0.5 + 0.35 * ((-1) ** i)
+        y = 0.35 if i % 2 else 0.95
         ax.plot([spec['z0'], spec['z1']], [y, y], lw=10, solid_capstyle='butt',
                 color=colors.get(spec['name'], '#888'))
-        ax.text(0.5 * (spec['z0'] + spec['z1']), y + 0.12 * ((-1) ** i),
+        ax.text(0.5 * (spec['z0'] + spec['z1']), y + 0.09,
                 '%s\n2n=%d%s' % (spec['name'], 2 * spec['n'],
                                  ' skew' if spec['skew'] else ''),
-                ha='center', va='bottom' if i % 2 == 0 else 'top', fontsize=7)
+                ha='center', va='bottom', fontsize=7)
     if 'PERT' in set(df['element']):
         pz = df[df.element == 'PERT']['z_mid'].mean()
-        ax.plot([pz], [0.5], marker='*', ms=14, color='k')
-        ax.text(pz, 0.34, 'PERT', ha='center', fontsize=7)
+        ax.plot([pz], [0.15], marker='*', ms=14, color='k')
+        ax.text(pz, 0.02, 'PERT', ha='center', va='bottom', fontsize=7)
     ax.axvspan(MAPPING_VOLUME['z0'], MAPPING_VOLUME['z1'], color='0.9', zorder=0)
-    ax.set(xlabel='z [m]', ylim=(0, 1.3), yticks=[],
+    ax.set(xlabel='z [m]', ylim=(0, 1.55), yticks=[],
            title='Assembly layout (grey = mapping volume)')
     fig.tight_layout()
     fig.savefig(path, dpi=140)
