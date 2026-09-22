@@ -21,15 +21,25 @@ from . import tools as _tools
 
 # cross-section sampling for a multipole bar (W=8mm, T=15mm by default):
 # 5 x 6 nodes across the conductor, 5 mm along it.
-DXYZ_MULTIPOLE = np.array([2e-3, 3e-3, 5e-3])
-
-# Arcs need a finer step than straights at the same linear resolution: a corner
-# fillet is short, tightly curved and sits close to the mapping volume, so its
-# integrand varies far faster along the element than a 1.5 m body bar's does.
-# Measured on the MQ winding, the curl-free residual at the element end falls
-# 0.84 -> 0.19 -> 0.046 -> 0.011 G as this is halved, i.e. clean h^2 convergence
-# TO ZERO (contrast the chord closure, which converges to a nonzero 4.4 G).
-# A quarter of the straight-bar step puts it comfortably under the 0.3 G noise.
+# Integration steps.  MEASURED on the saddle assembly at the worst point in the
+# mapping volume (r = 50 mm at an element end), against the curl-free residual:
+#
+#   straight x / arc x     residual    wall time
+#      1.00 / 1.00          1.460 G       17 s      <- too coarse: above the 0.3 G noise
+#      1.00 / 0.25          1.656 G      330 s      <- refining ARCS alone buys nothing
+#      0.25 / 1.00          0.177 G       48 s      <- refining STRAIGHTS is what matters
+#      0.25 / 0.25          0.092 G      362 s      <- 7.6x the cost for 2x the accuracy
+#
+# So the straight-bar step drives the residual and the arc step barely enters.
+# (An earlier version had these 4:1 apart, arcs finer, on the reasoning that a
+# corner fillet is short and tightly curved.  That was measured on the
+# radial-return racetrack and does not carry over to the saddle, where the long
+# body bars dominate.  Both are now the same step.)
+#
+# The defaults below are the 0.25/1.00 row: comfortably under the noise at 2.8x
+# the cost of the old default.  Scale both together via add_field's dxyz and
+# dxyz_arc if you need the field cheaper or sharper.
+DXYZ_MULTIPOLE = np.array([0.5e-3, 0.75e-3, 1.25e-3])
 DXYZ_MULTIPOLE_ARC = np.array([0.5e-3, 0.75e-3, 1.25e-3])
 
 # bytes per element and number of (N_batch, nx, ny, nz) arrays that
