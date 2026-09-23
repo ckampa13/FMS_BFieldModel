@@ -43,13 +43,20 @@ def solve_linear(J, data, weights=None, offset=None, rcond=None, scale_covar=Fal
     col = np.linalg.norm(A, axis=0)
     col[col == 0] = 1.
     A /= col[np.newaxis, :]
+    # gesdd may overwrite A in place (Fortran-ordered input); keep a copy for the gesvd fallback then
+    A_bak = A.copy() if A.flags['F_CONTIGUOUS'] else None
     try:
         U, S, Vt = linalg.svd(A, full_matrices=False, lapack_driver='gesdd', overwrite_a=True,
                               check_finite=False)
-    except linalg.LinAlgError:
+        driver = 'gesdd'
+    except linalg.LinAlgError as e:
+        print(f'solve_linear: WARNING gesdd failed ({e}); falling back to gesvd.', flush=True)
+        if A_bak is not None:
+            A = A_bak
         U, S, Vt = linalg.svd(A, full_matrices=False, lapack_driver='gesvd', overwrite_a=True,
                               check_finite=False)
-    del A
+        driver = 'gesvd'
+    del A, A_bak
     if rcond is None:
         rcond = np.finfo(np.float64).eps * max(M, P)
     keep = S > rcond * S[0]
@@ -66,7 +73,7 @@ def solve_linear(J, data, weights=None, offset=None, rcond=None, scale_covar=Fal
     nfree = M - rank
     out = {'x': x, 'chi2': chi2, 'ndata': M, 'nvarys': P, 'nfree': nfree,
            'redchi': chi2 / nfree if nfree > 0 else np.nan, 'rank': rank,
-           'cond': float(S[0] / S[keep][-1]), 'sv': S, 'resid_w': resid_w,
+           'cond': float(S[0] / S[keep][-1]), 'sv': S, 'resid_w': resid_w, 'svd_driver': driver,
            'model': fit_w / w + off}
     if compute_covar:
         Vs = Vk.T / Sk[np.newaxis, :]    # (P, rank)
@@ -85,7 +92,7 @@ def solve_linear(J, data, weights=None, offset=None, rcond=None, scale_covar=Fal
         out.update({'covar': C, 'stderr': stderr, 'correl': correl, 'null_flag': null_flag})
     if verbose:
         print(f'solve_linear: M={M}, P={P}, rank={rank}, cond(column-normalised)={out["cond"]:0.3e}, '
-              +f'chi2={chi2:0.6e}, redchi={out["redchi"]:0.6e}'
+              +f'chi2={chi2:0.6e}, redchi={out["redchi"]:0.6e}, svd={driver}'
               +(f', {int(out["null_flag"].sum())} params touch null directions' if compute_covar and rank < P else ''))
     return out
 
