@@ -154,3 +154,85 @@ def test_v1010_bessel_setup_bit_identical(n_list, n_threads):
         for j, n in enumerate(n_list):
             assert np.array_equal(iv[m][j], special.iv(n, cms[m]*r))
             assert np.array_equal(ivp[m][j], special.ivp(n, cms[m]*r))
+
+
+# ---- linear_lsq / method='linear_fast' ----
+from mu2e.tools.linear_lsq import solve_linear, field_uncertainty
+
+
+def test_solve_linear_matches_normal_equations():
+    rng = np.random.default_rng(21)
+    M, P = 300, 12
+    J = rng.normal(size=(M, P)) * np.logspace(-3, 3, P)[np.newaxis, :]
+    x_true = rng.normal(size=P)
+    w = 1. / rng.uniform(0.5, 2.0, M)
+    data = J @ x_true + rng.normal(size=M) / w
+    sol = solve_linear(J, data, weights=w, verbose=False)
+    A = J * w[:, None]
+    C = np.linalg.inv(A.T @ A)
+    x = C @ (A.T @ (data * w))
+    np.testing.assert_allclose(sol['x'], x, rtol=1e-8)
+    np.testing.assert_allclose(sol['covar'], C, rtol=1e-8, atol=1e-14)
+    np.testing.assert_allclose(sol['stderr'], np.sqrt(np.diag(C)), rtol=1e-8)
+    assert sol['rank'] == P and not sol['null_flag'].any()
+    Je = rng.normal(size=(50, P))
+    np.testing.assert_allclose(field_uncertainty(Je, sol['covar'], chunk=7),
+                               np.sqrt(np.einsum('ij,jk,ik->i', Je, C, Je)), rtol=1e-8)
+
+
+def test_solve_linear_rank_deficient_flags_null_params():
+    rng = np.random.default_rng(22)
+    J = rng.normal(size=(200, 5))
+    J[:, 4] = 2. * J[:, 3]  # exact degeneracy
+    sol = solve_linear(J, rng.normal(size=200), verbose=False)
+    assert sol['rank'] == 4
+    assert sol['null_flag'][3] and sol['null_flag'][4] and not sol['null_flag'][:3].any()
+
+
+def fit_k0_df(method, tmp_path, save=False):
+    nk0 = [1, 2, 6, 10]
+    truth = {'Ek0_1': 0.3, 'Fk0_1': 2.0, 'Ek0_2': 0.1, 'Fk0_2': 6.6, 'Ek0_6': 0., 'Fk0_6': 0.02,
+             'Ek0_10': 0., 'Fk0_10': -0.01}
+    df = make_df(nk0, truth)
+    # add a small Bessel part too (ms = 3, n = 0..2) so the design matrix mixes term types
+    cp = cfg_params(pitch1=0, ms_h1=0, ns_h1=0, pitch2=0, ms_h2=0, ns_h2=0,
+                    length1=L, ms_c1=3, ns_c1=3, length2=0, ms_c2=0, ns_c2=0,
+                    ks_dict={'k1': [0., False], 'k2': [0., False], 'k3': [0., True], 'k4': [0., False],
+                             'k5': [0., True]},
+                    bs_tuples=None, bs_bounds=None, loss='linear', version=1010, method=method,
+                    noise=0.01, z0=Z0, n_list_k0=nk0, R_ref=RREF)
+    ffit = FieldFitter(df)
+    ffit.pickle_path = str(tmp_path) + '/'
+    ffit.fit(cp, cfg_pickle(False, save, 'x', 'x', False))
+    return ffit
+
+
+def test_linear_fast_matches_lmfit(tmp_path):
+    f_lm = fit_k0_df('linear', tmp_path)       # lmfit leastsq polish -> lmfit covar / stderr / correl
+    f_fa = fit_k0_df('linear_fast', tmp_path)
+    vn = f_lm.result.var_names
+    assert vn == f_fa.result.var_names
+    for k in vn:
+        np.testing.assert_allclose(f_fa.params[k].value, f_lm.params[k].value, rtol=1e-6, atol=1e-9)
+        np.testing.assert_allclose(f_fa.params[k].stderr, f_lm.params[k].stderr, rtol=1e-3)
+    np.testing.assert_allclose(f_fa.result.redchi, f_lm.result.redchi, rtol=1e-8)
+    np.testing.assert_allclose(f_fa.result.covar, f_lm.result.covar, rtol=2e-3,
+                               atol=1e-3*np.abs(f_lm.result.covar).max())
+    for i, a in enumerate(vn):
+        for j, b in enumerate(vn):
+            if i != j:
+                assert abs(f_fa.result.correl_matrix[i, j] - f_lm.params[a].correl[b]) < 1e-3
+    np.testing.assert_allclose(f_fa.result.eval_uncertainty(f_fa.params),
+                               f_lm.result.eval_uncertainty(f_lm.params), rtol=2e-3, atol=1e-12)
+    assert f_fa.result.linear_fast and f_fa.result.nvarys == len(vn) and f_fa.result.errorbars
+
+
+def test_linear_fast_pickles(tmp_path):
+    import pickle
+    f = fit_k0_df('linear_fast', tmp_path, save=True)
+    params = pickle.load(open(str(tmp_path) + '/x_results.p', 'rb'))
+    cd = pickle.load(open(str(tmp_path) + '/x_results_correl.p', 'rb'))
+    assert cd['variables'] == f.result.var_names
+    assert cd['correl'].shape == (len(f.result.var_names),)*2
+    for k in f.result.var_names:
+        assert params[k].vary and params[k].stderr == f.params[k].stderr

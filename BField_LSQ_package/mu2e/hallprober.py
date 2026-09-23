@@ -686,9 +686,16 @@ def field_map_analysis(name, cfg_data, cfg_geom, cfg_params, cfg_pickle, cfg_plo
 
         # If fit uncertainties were saved in main fit, compute also for fine grid
         if saveunc:
-            fit_unc = custom_eval_unc(model=model_eval, r=hall_measure_data_eval.R.values, z=hall_measure_data_eval.Z.values,
-                                      phi=hall_measure_data_eval.Phi.values, x=hall_measure_data_eval.X.values,
-                                      y=hall_measure_data.Y.values, params=ff.params)
+            if getattr(ff.result, 'linear_fast', False):
+                # method='linear_fast': sqrt(diag(J C J^T)) with the eval-point design matrix
+                fit_unc = ff.result.eval_uncertainty_design(
+                    ff_eval.fit_func, r=hall_measure_data_eval.R.values, z=hall_measure_data_eval.Z.values,
+                    phi=hall_measure_data_eval.Phi.values, x=hall_measure_data_eval.X.values,
+                    y=hall_measure_data_eval.Y.values)
+            else:
+                fit_unc = custom_eval_unc(model=model_eval, r=hall_measure_data_eval.R.values, z=hall_measure_data_eval.Z.values,
+                                          phi=hall_measure_data_eval.Phi.values, x=hall_measure_data_eval.X.values,
+                                          y=hall_measure_data.Y.values, params=ff.params)
             hall_measure_data_eval.loc[:,'Br_unc']   = fit_unc[0:len(fit_unc)//3]
             hall_measure_data_eval.loc[:,'Bz_unc']   = fit_unc[len(fit_unc)//3:2*len(fit_unc)//3]
             hall_measure_data_eval.loc[:,'Bphi_unc'] = fit_unc[2*len(fit_unc)//3:]
@@ -750,7 +757,12 @@ def field_map_analysis(name, cfg_data, cfg_geom, cfg_params, cfg_pickle, cfg_plo
 
         # If fit uncertainties were saved in main fit, compute also for fine grid
         if saveunc:
-            fit_unc = custom_eval_unc(model=model_fine, r=df_fine.R.values, z=df_fine.Z.values, phi=df_fine.Phi.values, x=df_fine.X.values, y=df_fine.Y.values, params=ff.params)
+            if getattr(ff.result, 'linear_fast', False):
+                fit_unc = ff.result.eval_uncertainty_design(
+                    ff_fine.fit_func, r=df_fine.R.values, z=df_fine.Z.values, phi=df_fine.Phi.values,
+                    x=df_fine.X.values, y=df_fine.Y.values)
+            else:
+                fit_unc = custom_eval_unc(model=model_fine, r=df_fine.R.values, z=df_fine.Z.values, phi=df_fine.Phi.values, x=df_fine.X.values, y=df_fine.Y.values, params=ff.params)
             df_fine.loc[:,'Br_unc']   = fit_unc[0:len(fit_unc)//3]
             df_fine.loc[:,'Bz_unc']   = fit_unc[len(fit_unc)//3:2*len(fit_unc)//3]
             df_fine.loc[:,'Bphi_unc'] = fit_unc[2*len(fit_unc)//3:]

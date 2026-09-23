@@ -51,6 +51,25 @@ import pandas as pd
 from lmfit import Model, Parameters, report_fit
 from mu2e import mu2e_ext_path
 from mu2e.tools import fit_funcs_redux as ff
+
+
+def linear_design_matrix(fit_func, free, p0, offset, kw):
+    '''d model / d p for the free (linear) parameters: the fit function's fast design_matrix when
+    it has one, else exact unit steps from p0 (all free = 0) with model offset.'''
+    if hasattr(fit_func, 'design_matrix'):
+        try:
+            return fit_func.design_matrix(free, **kw)
+        except NotImplementedError as e:
+            print(f'linear_design_matrix: {e} Using unit-step differences.')
+    if p0 is None:
+        raise ValueError('Unit-step design matrix needs p0 and offset.')
+    p0 = dict(p0)
+    J = np.empty((len(offset), len(free)))
+    for j, k in enumerate(free):
+        p0[k] = 1.
+        J[:, j] = fit_func(**kw, **p0) - offset
+        p0[k] = 0.
+    return J
 import os 
 
 class FitStatus:
@@ -449,7 +468,7 @@ class FieldFitter:
             print_status = FitStatus(1000)
             # mag = 1/np.sqrt(Br**2+Bz**2+Bphi**2)
             #if cfg_params.method == 'leastsq' or cfg_params.method == 'brute':
-            if cfg_params.method not in ('least_squares', 'linear'):
+            if cfg_params.method not in ('least_squares', 'linear', 'linear_fast'):
                 self.result = self.mod.fit(np.concatenate([self.Br, self.Bz, self.Bphi]).ravel(),
                                            weights=weights, scale_covar=False,
                                            r=self.RR, z=self.ZZ, phi=self.PP, x=self.XX, y=self.YY, params=self.params,
@@ -477,6 +496,8 @@ class FieldFitter:
                                            })
             elif cfg_params.method == 'linear':
                 self.result = self.fit_linear(weights, print_status)
+            elif cfg_params.method == 'linear_fast':
+                self.result = self.fit_linear_fast(weights)
             else:
                 print('Error, only supported methods are leastsq and least_squares')
                 exit()
@@ -551,6 +572,76 @@ class FieldFitter:
         print(f'fit_linear: polish redchi={result.redchi:0.6e}, nfev={result.nfev}')
         return result
 
+    def fit_linear_fast(self, weights):
+        '''Direct weighted linear least squares by SVD (mu2e.tools.linear_lsq) with the full
+        covariance, stderr and correlation matrix, and no lmfit iterations. Returns a standard
+        lmfit ModelResult (one evaluation at the solution with all parameters fixed) patched with
+        the linear-solution statistics, so report_fit, pickling, recreate and merge_data_fit_res
+        work unchanged. eval_uncertainty uses the design matrix (sqrt(diag(J C J^T))).
+        Every free parameter must enter the model linearly.'''
+        import types
+        from mu2e.tools.linear_lsq import solve_linear, field_uncertainty, t_scale
+        t0 = time()
+        data = np.concatenate([self.Br, self.Bz, self.Bphi]).ravel()
+        kw = dict(r=self.RR, z=self.ZZ, phi=self.PP, x=self.XX, y=self.YY)
+        free = [p for p in self.params if self.params[p].vary]
+        p0 = {k: v for k, v in self.params.valuesdict().items()}
+        for k in free:
+            p0[k] = 0.
+        offset = self.fit_func(**kw, **p0)
+        J = linear_design_matrix(self.fit_func, free, p0, offset, kw)
+        t1 = time()
+        sol = solve_linear(J, data, weights=weights, offset=offset, overwrite_J=True)
+        del J
+        t2 = time()
+        # standard ModelResult at the solution (all fixed, one evaluation), then patch statistics
+        for k, v in zip(free, sol['x']):
+            self.params[k].value = v
+        pfix = deepcopy(self.params)
+        for k in pfix:
+            pfix[k].vary = False
+        result = self.mod.fit(data, weights=weights, scale_covar=False, params=pfix,
+                              method='leastsq', max_nfev=1, **kw)
+        ndata, nvarys = len(data), len(free)
+        result.var_names = free
+        result.nvarys = nvarys
+        result.nfree = ndata - nvarys
+        result.redchi = result.chisqr / result.nfree
+        _n2ll = ndata * np.log(result.chisqr / ndata)
+        result.aic = _n2ll + 2 * nvarys
+        result.bic = _n2ll + np.log(ndata) * nvarys
+        result.covar = sol['covar']
+        result.errorbars = True
+        for j, k in enumerate(free):
+            result.params[k].vary = True
+            result.params[k].stderr = float(sol['stderr'][j])
+            result.params[k].correl = None
+        result.method = 'linear_fast'
+        result.message = (f'linear_fast: SVD solve, rank {sol["rank"]}/{nvarys}, '
+                          +f'cond {sol["cond"]:0.3e}')
+        result.linear_fast = True
+        result.correl_matrix = sol['correl']
+        result.null_flag = sol['null_flag']
+        result.linear_info = {k: sol[k] for k in ['rank', 'cond', 'chi2', 'redchi', 'sv']}
+        fit_func = self.fit_func
+
+        def eval_uncertainty_design(res, fit_func_, sigma=1, **kw_):
+            J_ = linear_design_matrix(fit_func_, res.var_names, None, None, kw_)
+            return field_uncertainty(J_, res.covar) * t_scale(res.ndata, res.nvarys, sigma)
+
+        def eval_uncertainty(res, params=None, sigma=1, **kw_):
+            # uncertainty at the fit points (kw_ ignored: the design matrix needs the factory points)
+            return eval_uncertainty_design(res, fit_func, sigma=sigma, **kw)
+
+        result.eval_uncertainty_design = types.MethodType(eval_uncertainty_design, result)
+        result.eval_uncertainty = types.MethodType(eval_uncertainty, result)
+        print(f'fit_linear_fast: design {t1-t0:0.1f} s, solve+covar {t2-t1:0.1f} s, '
+              +f'total {time()-t0:0.1f} s; redchi={result.redchi:0.6e} (solve: {sol["redchi"]:0.6e})')
+        if sol['rank'] < nvarys:
+            print(f'fit_linear_fast: WARNING rank {sol["rank"]} < {nvarys}; stderr of '
+                  +f'{int(sol["null_flag"].sum())} params are pseudo-inverse lower bounds.')
+        return result
+
     def pickle_results(self, pickle_name='default'):
         """Pickle the resulting Parameters after a fit is performed."""
 
@@ -558,6 +649,15 @@ class FieldFitter:
 
     def pickle_correl(self, pickle_name='default'):
         """Pickle the resulting Parameters after a fit is performed."""
+        # method='linear_fast': correlation matrix computed directly (no per-parameter dicts)
+        if getattr(self.result, 'linear_fast', False):
+            self.correl = self.result.correl_matrix
+            self.correl_dict = {'variables': self.result.var_names,
+                                'covar': self.result.covar,
+                                'correl': self.correl,
+                                'null_flag': self.result.null_flag}
+            pkl.dump(self.correl_dict, open(pickle_name+'_results_correl.p', "wb"), pkl.HIGHEST_PROTOCOL)
+            return
         # compute correlation matrix, if possible
         try:
             # v = np.sqrt(np.diag(self.result.covar))
