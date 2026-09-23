@@ -270,6 +270,18 @@ class FieldFitter:
                 pvd['length1'], pvd['ms_c1'], pvd['ns_c1'],
                 pvd['length2'], pvd['ms_c2'], pvd['ns_c2'],
                 self.bz_calc_data, self.br_calc_data, self.bphi_calc_data)
+        elif func_version == 1010:
+            self.fit_func = ff.brzphi_3d_producer_giant_function_v1010(
+                self.ZZ, self.RR, self.PP,
+                pvd['pitch1'], pvd['ms_h1'], pvd['ns_h1'],
+                pvd['pitch2'], pvd['ms_h2'], pvd['ns_h2'],
+                pvd['length1'], pvd['ms_c1'], pvd['ns_c1'],
+                pvd['length2'], pvd['ms_c2'], pvd['ns_c2'],
+                pvd['z0'],
+                n_list_c1=cfg_params.n_list_c1, n_list_k0=cfg_params.n_list_k0,
+                R_ref=cfg_params.R_ref,
+                bz_input=self.bz_calc_data, br_input=self.br_calc_data,
+                bphi_input=self.bphi_calc_data)
         else:
             raise NotImplementedError(f'Function version={func_version} not implemented.')
 
@@ -360,6 +372,23 @@ class FieldFitter:
                 self.params.add('z0', value=cfg_params.z0, vary=False)
             else:
                 self.params.add('z0', value=0.0, vary=False)
+        # v1008 + k=0 multipole terms, optional Bessel order subset
+        elif (func_version == 1010):
+            self.add_params_hel(1)
+            self.add_params_hel(2)
+            self.add_params_cyl_v1010(1, n_list=cfg_params.n_list_c1, AB_lim=cfg_params.AB_lim)
+            self.add_params_cyl(2)
+            self.add_params_k0_v1010(cfg_params.n_list_k0, R_ref=cfg_params.R_ref, AB_lim=cfg_params.AB_lim)
+            self.add_params_cart_simple_fixable(cfg_params)
+            self.add_params_biot_savart(cfg_params, cfg_pickle.recreate)
+            #z0
+            if 'z0' not in self.params:
+                if not cfg_params.z0 is None:
+                    self.params.add('z0', value=cfg_params.z0, vary=False)
+                else:
+                    self.params.add('z0', value=0.0, vary=False)
+            if not cfg_pickle.recreate:
+                self.check_degeneracy_v1010(cfg_params.n_list_k0)
 
     def model(self):
         return Model(self.fit_func, independent_vars=['r', 'z', 'phi', 'x', 'y'])
@@ -420,7 +449,7 @@ class FieldFitter:
             print_status = FitStatus(1000)
             # mag = 1/np.sqrt(Br**2+Bz**2+Bphi**2)
             #if cfg_params.method == 'leastsq' or cfg_params.method == 'brute':
-            if cfg_params.method != 'least_squares':
+            if cfg_params.method not in ('least_squares', 'linear'):
                 self.result = self.mod.fit(np.concatenate([self.Br, self.Bz, self.Bphi]).ravel(),
                                            weights=weights, scale_covar=False,
                                            r=self.RR, z=self.ZZ, phi=self.PP, x=self.XX, y=self.YY, params=self.params,
@@ -446,6 +475,8 @@ class FieldFitter:
                                                                                                   #'x_scale': 'jac', # default is None -- how to scale each free param
                                                                                                   #'diff_step': 1e-6*np.ones_like(self.params.keys()), # default is some optimal value based on machine epsilon
                                            })
+            elif cfg_params.method == 'linear':
+                self.result = self.fit_linear(weights, print_status)
             else:
                 print('Error, only supported methods are leastsq and least_squares')
                 exit()
@@ -463,6 +494,62 @@ class FieldFitter:
 
     def fit_external(self, cfg_params, cfg_pickle, profile=False):
         raise NotImplementedError('Oh no! you got lazy during refactoring')
+
+    def fit_linear(self, weights, print_status=None):
+        '''Direct weighted linear least squares (every free parameter must enter linearly),
+        followed by an lmfit leastsq polish from the solution so self.result (covar, stderr,
+        correl, eval_uncertainty) is a standard ModelResult.'''
+        from scipy import linalg
+        t0 = time()
+        data = np.concatenate([self.Br, self.Bz, self.Bphi]).ravel()
+        kw = dict(r=self.RR, z=self.ZZ, phi=self.PP, x=self.XX, y=self.YY)
+        free = [p for p in self.params if self.params[p].vary]
+        pv = self.params.valuesdict()
+        p0 = {k: v for k, v in pv.items()}
+        for k in free:
+            p0[k] = 0.
+        offset = self.fit_func(**kw, **p0)
+        J = None
+        if hasattr(self.fit_func, 'design_matrix'):
+            try:
+                J = self.fit_func.design_matrix(free, **kw)
+                print(f'fit_linear: fast design matrix, shape {J.shape}')
+            except NotImplementedError as e:
+                print(f'fit_linear: {e} Using unit-step differences.')
+                J = None
+        if J is None:
+            # exact for a model linear in the free parameters
+            J = np.empty((len(offset), len(free)))
+            for j, k in enumerate(free):
+                p0[k] = 1.
+                J[:, j] = self.fit_func(**kw, **p0) - offset
+                p0[k] = 0.
+            print(f'fit_linear: design matrix by unit steps, shape {J.shape}')
+        if weights is None:
+            w = np.ones_like(data)
+        else:
+            w = weights
+        A = J * w[:, np.newaxis]
+        b = (data - offset) * w
+        del J
+        col = np.linalg.norm(A, axis=0)
+        col[col == 0] = 1.
+        A /= col[np.newaxis, :]
+        sol, _, rank, sv = linalg.lstsq(A, b, lapack_driver='gelsd', check_finite=False)
+        x = sol / col
+        cond = sv[0] / sv[-1] if sv[-1] > 0 else np.inf
+        chi2 = np.sum((A @ sol - b)**2)
+        print(f'fit_linear: P={len(free)}, rank={rank}, cond(column-normalised)={cond:0.3e}, '
+              +f'chi2={chi2:0.6e}, redchi={chi2/(len(b)-len(free)):0.6e}, time={time()-t0:0.1f} s')
+        del A
+        for k, v in zip(free, x):
+            self.params[k].value = v
+        # polish (should converge in ~1 Jacobian) to get a standard lmfit result
+        print('fit_linear: lmfit leastsq polish from the linear solution...')
+        result = self.mod.fit(data, weights=weights, scale_covar=False, params=self.params,
+                              iter_cb=print_status, method='leastsq', **kw)
+        print(f'fit_linear: polish redchi={result.redchi:0.6e}, nfev={result.nfev}')
+        return result
 
     def pickle_results(self, pickle_name='default'):
         """Pickle the resulting Parameters after a fit is performed."""
@@ -780,6 +867,87 @@ class FieldFitter:
                 #    self.params[f'cos_beta_{m}_{n}'].value = 1.0
                 #    self.params[f'cos_beta_{m}_{n}'].vary = False
 
+
+    def add_params_cyl_v1010(self, num, n_list=None, AB_lim=None):
+        # same as v1008, but only for the Bessel orders in n_list (default: range(ns_c{num}))
+        ms_range = range(self.params[f'ms_c{num}'].value)
+        if n_list is None:
+            n_list = range(self.params[f'ns_c{num}'].value)
+        n_list = [int(n) for n in n_list]
+        m_max = self.params['ms_asym_max'].value
+        # avoid division by zero for ms = 1
+        m_f = max(len(ms_range) - 1, 1)
+        if m_max < 0:
+            m_max = np.inf
+
+        # limits on A/B?
+        if AB_lim is None:
+            AB_min = None
+            AB_max = None
+        else:
+            AB_min = -AB_lim
+            AB_max = AB_lim
+
+        for m in ms_range:
+            for n in n_list:
+                if (m > m_max) & (n > 0):
+                    var = False
+                    val0 = 0.
+                    val1 = 0.
+                else:
+                    var = True
+                    val0 = 100 * (-1. + m/m_f)*(-1.)**m
+                    val1 = -100 * (-1. + m/m_f)*(-1.)**m
+                # A, B, C, D are linear
+                for P, val in zip(['A', 'B', 'C', 'D'], [val0, val1, val0, val1]):
+                    if f'{P}c{num}_{m}_{n}' not in self.params:
+                        self.params.add(f'{P}c{num}_{m}_{n}', value=val, vary=var, min=AB_min, max=AB_max)
+                    else:
+                        self.params[f'{P}c{num}_{m}_{n}'].vary = var
+                # n = 0, fixed for C and D
+                if n == 0:
+                    self.params[f'Cc{num}_{m}_{n}'].value = 0.0
+                    self.params[f'Dc{num}_{m}_{n}'].value = 0.0
+                    self.params[f'Cc{num}_{m}_{n}'].vary = False
+                    self.params[f'Dc{num}_{m}_{n}'].vary = False
+
+    def add_params_k0_v1010(self, n_list_k0, R_ref=None, AB_lim=None):
+        # k=0 (z-independent) 2D multipoles: Ek0_n (skew, A_n) and Fk0_n (normal, B_n) at R_ref
+        if n_list_k0 is None:
+            n_list_k0 = []
+        if R_ref is None:
+            R_ref = 0.05
+        if 'R_ref' not in self.params:
+            self.params.add('R_ref', value=R_ref, vary=False)
+        else:
+            self.params['R_ref'].value = R_ref
+        if AB_lim is None:
+            AB_min = None
+            AB_max = None
+        else:
+            AB_min = -AB_lim
+            AB_max = AB_lim
+        for n in n_list_k0:
+            for P in ['E', 'F']:
+                if f'{P}k0_{int(n)}' not in self.params:
+                    self.params.add(f'{P}k0_{int(n)}', value=0., vary=True, min=AB_min, max=AB_max)
+                else:
+                    self.params[f'{P}k0_{int(n)}'].vary = True
+
+    def check_degeneracy_v1010(self, n_list_k0):
+        # k=0 terms that duplicate a cartesian k term exactly
+        if n_list_k0 is None:
+            return
+        pairs = [('Ek0_1', 'k1', 'uniform Bx'), ('Fk0_1', 'k2', 'uniform By'),
+                 ('Fk0_2', 'k4', 'normal quad (Phi = k4 x y)')]
+        bad = []
+        for p_k0, p_k, desc in pairs:
+            if (p_k0 in self.params) and (p_k in self.params):
+                if self.params[p_k0].vary and self.params[p_k].vary:
+                    bad.append(f'{p_k0} <-> {p_k} ({desc})')
+        if len(bad) > 0:
+            raise ValueError('v1010: degenerate free parameters: ' + '; '.join(bad)
+                             + '. Fix the cartesian k terms (vary=False in ks_dict).')
 
     def add_params_cyl_v1008(self, num, AB_lim=None):
         ms_range = range(self.params[f'ms_c{num}'].value)

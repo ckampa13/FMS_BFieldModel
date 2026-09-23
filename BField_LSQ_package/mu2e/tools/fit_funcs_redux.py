@@ -5013,3 +5013,375 @@ def brzphi_3d_producer_giant_function_v1009(z, r, phi,
 
         return np.concatenate([model_r, model_z, model_phi]).ravel()
     return brzphi_3d_fast
+
+
+# v1008 + k=0 (z-independent, pure 2D) multipole terms, optional subset of Bessel orders,
+# and a fast design matrix for the linear solver (FieldFitter method='linear')
+def brzphi_3d_producer_giant_function_v1010(z, r, phi,
+                                            pitch1, ms_h1, ns_h1,
+                                            pitch2, ms_h2, ns_h2,
+                                            length1, ms_c1, ns_c1,
+                                            length2, ms_c2, ns_c2,
+                                            z0,
+                                            n_list_c1=None, n_list_k0=None, R_ref=None,
+                                            bz_input=None, br_input=None, bphi_input=None):
+    '''
+    Factory function that readies a potential fit function for a 3D magnetic field.
+    Same as v1008 (2 cylindrical expansions, 2 helical expansions, BS functions, trivial
+    cartesian functions), plus:
+
+    k=0 terms (z-independent 2D multipoles), for each n in n_list_k0 (n >= 1):
+        Phi = (R_ref/n) (r/R_ref)^n [E_n cos(n phi) + F_n sin(n phi)]
+        Br = (r/R_ref)^(n-1) [E_n cos(n phi) + F_n sin(n phi)]
+        Bphi = (r/R_ref)^(n-1) [-E_n sin(n phi) + F_n cos(n phi)]
+        Bz = 0
+    so F_n = B_n (normal) and E_n = A_n (skew) at R_ref, in the field units of the data.
+    These are the k -> 0 limit missing from the cylindrical expansion (all k >= 2 pi/L).
+    Degenerate with the cartesian terms: E_1 <-> k1, F_1 <-> k2, F_2 <-> k4.
+
+    n_list_c1: Bessel orders n used in cylindrical expansion 1 (default: range(ns_c1), as v1008).
+    Parameter names keep the real n (Ac1_{m}_{n}, ...).
+
+    The returned function has an attribute design_matrix(param_names, z, r, phi, x, y), which
+    returns the (3N, P) matrix d model / d param for linear params (the model is linear in
+    every A, B, C, D, E, F, k parameter).
+
+    Ms always have a +1, Ns always start at 0 (The m=0 term is always 0)
+    '''
+    if n_list_c1 is None:
+        n_list_c1 = list(range(ns_c1))
+    n_list_c1 = [int(n) for n in n_list_c1]
+    if n_list_k0 is None:
+        n_list_k0 = []
+    n_list_k0 = [int(n) for n in n_list_k0]
+    if any([n < 1 for n in n_list_k0]):
+        raise ValueError(f'n_list_k0 must have n >= 1 (n=0, k=0 is a constant potential): {n_list_k0}')
+    if R_ref is None:
+        R_ref = 0.05
+    nc1 = len(n_list_c1)
+
+    # Set up helical bessels
+    pitch1b = pitch1/(2*np.pi)
+    pitch2b = pitch2/(2*np.pi)
+
+    iv_h1 = np.zeros((ms_h1, ns_h1, len(r)))
+    ivp_h1 = np.zeros((ms_h1, ns_h1, len(r)))
+    hms1 = np.zeros(ms_h1)
+
+    iv_h2 = np.zeros((ms_h2, ns_h2, len(r)))
+    ivp_h2 = np.zeros((ms_h2, ns_h2, len(r)))
+    hms2 = np.zeros(ms_h2)
+
+    for m_h1 in range(ms_h1):
+        hms1[m_h1] = (m_h1+1)/pitch1b
+        for n_h1 in range(ns_h1):
+                iv_h1[m_h1][n_h1] = special.iv(n_h1, hms1[m_h1]*r)
+                ivp_h1[m_h1][n_h1] = special.ivp(n_h1, hms1[m_h1]*r)
+
+    for m_h2 in range(ms_h2):
+        hms2[m_h2] = (m_h2+1)/pitch2b
+        for n_h2 in range(ns_h2):
+                iv_h2[m_h2][n_h2] = special.iv(n_h2, hms2[m_h2]*r)
+                ivp_h2[m_h2][n_h2] = special.ivp(n_h2, hms2[m_h2]*r)
+
+    # Set up cylindrical bessels (index j <-> order n_list_c1[j])
+    cms1 = np.zeros(ms_c1)
+    iv_c1 = np.zeros((ms_c1, nc1, len(r)))
+    ivp_c1 = np.zeros((ms_c1, nc1, len(r)))
+    sinkz_c1 = np.zeros((ms_c1, len(z)))
+    coskz_c1 = np.zeros((ms_c1, len(z)))
+    sinnp_c1 = np.zeros((nc1, len(phi)))
+    cosnp_c1 = np.zeros((nc1, len(phi)))
+    # translate z for cos and sin
+    z_ = z - z0
+
+    for j, n in enumerate(n_list_c1):
+        sinnp_c1[j] = np.sin(n*phi)
+        cosnp_c1[j] = np.cos(n*phi)
+
+    for m in range(ms_c1):
+        cms1[m] = (2*(m+1)*np.pi/length1)
+        sinkz_c1[m] = np.sin(cms1[m]*z_)
+        coskz_c1[m] = np.cos(cms1[m]*z_)
+        for j, n in enumerate(n_list_c1):
+            iv_c1[m][j] = special.iv(n, cms1[m]*r)
+            ivp_c1[m][j] = special.ivp(n, cms1[m]*r)
+    # first order correction for small r (Bphi ~ I_n(kr)/r), as in v1008:
+    # n=1 -> k/2; n>=2 -> n k^n r^(n-1) / (2^n n!). f_r < 0 flags "not needed".
+    eps = 1e-7
+    f_r_m_n = np.zeros((ms_c1, nc1, len(r))) - 1
+    if ms_c1 > 0:
+        cms_r = cms1[:, np.newaxis] * r[np.newaxis, :]
+        for m in range(ms_c1):
+            cms = cms1[m]
+            m_ = (cms_r[m] < eps)
+            if not np.any(m_):
+                continue
+            r_small = r[m_]
+            for j, n in enumerate(n_list_c1):
+                if n >= 2:
+                    f_r_m_n[m][j][m_] = n * cms**n * r_small**(n-1) / (2.**n * factorial(n))
+        del(cms_r)
+    print(f'v1010: ms_c1={ms_c1}, n_list_c1={n_list_c1}, n_list_k0={n_list_k0}, R_ref={R_ref}, '
+          +f'small-r corrections: {(f_r_m_n > -1).sum()} / {f_r_m_n.size}')
+
+    # k=0 terms
+    nk0 = len(n_list_k0)
+    sinnp_k0 = np.zeros((nk0, len(phi)))
+    cosnp_k0 = np.zeros((nk0, len(phi)))
+    for j, n in enumerate(n_list_k0):
+        sinnp_k0[j] = np.sin(n*phi)
+        cosnp_k0[j] = np.cos(n*phi)
+
+    jv_c2 = np.zeros((ms_c2, ns_c2, len(r)))
+    jvp_c2 = np.zeros((ms_c2, ns_c2, len(r)))
+
+    b_zeros = []
+    for n_c2 in range(ns_c2):
+        b_zeros.append(special.jn_zeros(n_c2, ms_c2))
+    cms2 = np.asarray([b/length2 for b in b_zeros])
+    for m_c2 in range(ms_c2):
+        for n_c2 in range(ns_c2):
+            jv_c2[m_c2][n_c2] = special.jv(n_c2, cms2[n_c2][m_c2]*r)
+            jvp_c2[m_c2][n_c2] = special.jvp(n_c2, cms2[n_c2][m_c2]*r)
+
+    # PAPER CALLS THIS LEFT HANDED
+    @njit(parallel=True)
+    def calc_b_fields_helR(z, phi, r, hms, n, A, B, iv, ivp, model_r, model_z, model_phi):
+        for i in prange(z.shape[0]):
+            model_r[i] += hms * \
+                (ivp[i]*(A*np.cos(hms*z[i]+n*phi[i]) +
+                         B*np.sin(hms*z[i]+n*phi[i])))
+
+            model_z[i] += hms * \
+                (iv[i]*(-A*np.sin(hms*z[i]+n*phi[i]) +
+                        B*np.cos(hms*z[i]+n*phi[i])))
+            if abs(r[i]) >= 1e-5:
+                model_phi[i] += (1.0/r[i]) * \
+                    -(n*iv[i]*(A*np.sin(hms*z[i]+n*phi[i]) -
+                               B*np.cos(hms*z[i]+n*phi[i])))
+
+    # PAPER CALLS THIS RIGHT HANDED
+    @njit(parallel=True)
+    def calc_b_fields_helL(z, phi, r, hms, n, C, D, iv, ivp, model_r, model_z, model_phi):
+        for i in prange(z.shape[0]):
+            model_r[i] += hms * \
+                (ivp[i]*(C*np.cos(-hms*z[i]+n*phi[i]) +
+                         D*np.sin(-hms*z[i]+n*phi[i])))
+
+            model_z[i] += -hms * \
+                (iv[i]*(-C*np.sin(-hms*z[i]+n*phi[i]) +
+                        D*np.cos(-hms*z[i]+n*phi[i])))
+
+            if abs(r[i]) >= 1e-5:
+                model_phi[i] += (1.0/r[i]) * \
+                    -(n*iv[i]*(C*np.sin(-hms*z[i]+n*phi[i]) -
+                               D*np.cos(-hms*z[i]+n*phi[i])))
+
+    @njit(parallel=True)
+    def calc_b_fields_cyl(z, phi, r, cms, n, f_r, A, B, C, D, iv, ivp, sinkz, coskz, sinnp, cosnp, model_r, model_z, model_phi, eps):
+        for i in prange(z.shape[0]):
+            if n > 0:
+                model_r[i] += ivp[i]*cms*(A*coskz[i]*cosnp[i] + B*sinkz[i]*cosnp[i] + C*coskz[i]*sinnp[i] + D*sinkz[i]*sinnp[i])
+                model_z[i] += iv[i] *cms*(-A*sinkz[i]*cosnp[i] + B*coskz[i]*cosnp[i] - C*sinkz[i]*sinnp[i] + D*coskz[i]*sinnp[i])
+                if cms*r[i] >= eps:
+                    model_phi[i] += n*(1/r[i])*iv[i]*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+                else:
+                    if n==1:
+                        ffac = cms/2. # approx
+                    else:
+                        ffac = f_r[i]
+                    model_phi[i] += ffac*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+            else:
+                model_r[i] += ivp[i]*cms*(A*coskz[i] + B*sinkz[i])
+                model_z[i] += iv[i]*cms*(-A*sinkz[i] + B*coskz[i])
+
+    @njit(parallel=True)
+    def calc_b_fields_k0(r, n, R_ref, E, F, sinnp, cosnp, model_r, model_phi):
+        for i in prange(r.shape[0]):
+            rn = (r[i]/R_ref)**(n-1)
+            model_r[i] += rn*(E*cosnp[i] + F*sinnp[i])
+            model_phi[i] += rn*(-E*sinnp[i] + F*cosnp[i])
+
+    @njit(parallel=True)
+    def calc_b_fields_cyl2(z, phi, r, cms, n, A, B, D, jv, jvp, model_r, model_z, model_phi):
+        for i in prange(z.shape[0]):
+            model_r[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
+                jvp[i]*cms*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
+
+            model_z[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
+                jv[i]*cms*(A*np.cosh(cms*z[i]) + B*np.sinh(cms*z[i]))
+            if abs(r[i]) >= 1e-5:
+                model_phi[i] += n*(D*np.cos(n*phi[i]) - (1-D)*np.sin(n*phi[i])) * \
+                    (1/r[i])*jv[i]*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
+
+    @njit(parallel=True)
+    def calc_b_fields_cart(x, y, z, phi, vx, vy, vz, x0, y0, z0,
+                           model_r, model_phi, model_z):
+        for i in prange(z.shape[0]):
+            v = np.array([vx, vy, vz])
+            r = np.array([x[i]-x0, y[i]-y0, z[i]-z0])
+            rsq = np.linalg.norm(r)**2
+            res = np.array([v[1]*r[2]-v[2]*r[1], v[2]*r[0]-v[0]*r[2],
+                            v[0]*r[1]-v[1]*r[0]])/rsq
+            model_xt, model_yt, model_zt = res
+
+            model_z[i] += model_zt
+            model_r[i] += model_xt*np.cos(phi[i]) + model_yt*np.sin(phi[i])
+            model_phi[i] += -model_xt*np.sin(phi[i]) + model_yt*np.cos(phi[i])
+
+    @njit(parallel=True)
+    def calc_b_fields_cart2(x, y, z, phi, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                            model_r, model_phi, model_z):
+        for i in prange(z.shape[0]):
+            # Kampa
+            model_x = k1 + k4*y[i] + k5*z[i] + k7*y[i]*z[i]
+            model_y = k2 + k4*x[i] + k6*z[i] + k7*x[i]*z[i]
+
+            model_z[i] += k3 + k5*x[i] + k6*y[i] + k7*x[i]*y[i]
+
+            model_r[i] += model_x*np.cos(phi[i]) + model_y*np.sin(phi[i])
+            model_phi[i] += -model_x*np.sin(phi[i]) + model_y*np.cos(phi[i])
+
+    def brzphi_3d_fast(z, r, phi, x, y, **AB_params):
+        """ 3D model for Bz Br and Bphi vs Z and R. Can take any number of AnBn terms."""
+
+        model_r = np.zeros(z.shape, dtype=np.float64)
+        model_z = np.zeros(z.shape, dtype=np.float64)
+        model_phi = np.zeros(z.shape, dtype=np.float64)
+
+        z0 = AB_params['z0']
+        z_ = z - z0
+
+        # PAPER CALLS THIS RIGHT HANDED
+        for m in range(ms_h1):
+            for n in range(ns_h1):
+                A = AB_params[f'Ah1_{m}_{n}']
+                B = AB_params[f'Bh1_{m}_{n}']
+                C = AB_params[f'Ch1_{m}_{n}']
+                D = AB_params[f'Dh1_{m}_{n}']
+                calc_b_fields_helR(z_, phi, r, hms1[m], n, A, B, iv_h1[m][n], ivp_h1[m][n],
+                                   model_r, model_z, model_phi)
+                calc_b_fields_helL(z_, phi, r, hms1[m], n, C, D, iv_h1[m][n], ivp_h1[m][n],
+                                   model_r, model_z, model_phi)
+
+        # PAPER CALLS THIS LEFT HANDED
+        for m in range(ms_h2):
+            for n in range(ns_h2):
+                A = AB_params[f'Ah2_{m}_{n}']
+                B = AB_params[f'Bh2_{m}_{n}']
+                C = AB_params[f'Ch2_{m}_{n}']
+                D = AB_params[f'Dh2_{m}_{n}']
+                calc_b_fields_helR(z_, phi, r, hms2[m], n, A, B, iv_h2[m][n], ivp_h2[m][n],
+                                   model_r, model_z, model_phi)
+                calc_b_fields_helL(z_, phi, r, hms2[m], n, C, D, iv_h2[m][n], ivp_h2[m][n],
+                                   model_r, model_z, model_phi)
+
+        for m in range(ms_c1):
+            for j, n in enumerate(n_list_c1):
+                A = AB_params[f'Ac1_{m}_{n}']
+                B = AB_params[f'Bc1_{m}_{n}']
+                C = AB_params[f'Cc1_{m}_{n}']
+                D = AB_params[f'Dc1_{m}_{n}']
+                calc_b_fields_cyl(z_, phi, r, cms1[m], n,
+                                  f_r_m_n[m][j],
+                                  A, B, C, D, iv_c1[m][j], ivp_c1[m][j],
+                                  sinkz_c1[m], coskz_c1[m],
+                                  sinnp_c1[j], cosnp_c1[j],
+                                  model_r, model_z, model_phi,
+                                  eps,
+                                  )
+
+        # k=0 (pure 2D multipole) terms
+        for j, n in enumerate(n_list_k0):
+            E = AB_params[f'Ek0_{n}']
+            F = AB_params[f'Fk0_{n}']
+            calc_b_fields_k0(r, n, R_ref, E, F, sinnp_k0[j], cosnp_k0[j], model_r, model_phi)
+
+        for m in range(ms_c2):
+            for n in range(ns_c2):
+                A = AB_params[f'Ac2_{m}_{n}']
+                B = AB_params[f'Bc2_{m}_{n}']
+                D = AB_params[f'Dc2_{n}']
+                calc_b_fields_cyl2(z_, phi, r, cms2[n][m], n, A, B, D, jv_c2[m][n], jvp_c2[m][n],
+                                   model_r, model_z, model_phi)
+
+        n_bs = len([bs for bs in AB_params.keys() if 'vx' in bs])
+        for i in range(1, n_bs+1):
+            vx = AB_params[f'vx{i}']
+            vy = AB_params[f'vy{i}']
+            vz = AB_params[f'vz{i}']
+            x0 = AB_params[f'x{i}']
+            y0 = AB_params[f'y{i}']
+            z0 = AB_params[f'z{i}']
+            calc_b_fields_cart(x, y, z_, phi, vx, vy, vz, x0, y0, z0,
+                               model_r, model_phi, model_z)
+
+        k1 = AB_params['k1']
+        k2 = AB_params['k2']
+        k3 = AB_params['k3']
+        k4 = AB_params['k4']
+        k5 = AB_params['k5']
+        k6 = AB_params['k6']
+        k7 = AB_params['k7']
+        k8 = AB_params['k8']
+        k9 = AB_params['k9']
+        k10 = AB_params['k10']
+        calc_b_fields_cart2(x, y, z_, phi, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                            model_r, model_phi, model_z)
+
+        # any calculated fields to add on?
+        # e.g. bus bars
+        if bz_input is not None:
+            model_z += bz_input
+        if br_input is not None:
+            model_r += br_input
+        if bphi_input is not None:
+            model_phi += bphi_input
+
+        return np.concatenate([model_r, model_z, model_phi]).ravel()
+
+    j_c1 = {n: j for j, n in enumerate(n_list_c1)}
+    j_k0 = {n: j for j, n in enumerate(n_list_k0)}
+    cyl_coef = {'A': (1., 0., 0., 0.), 'B': (0., 1., 0., 0.), 'C': (0., 0., 1., 0.), 'D': (0., 0., 0., 1.)}
+    k_names = [f'k{i}' for i in range(1, 11)]
+
+    def design_matrix(param_names, z, r, phi, x, y):
+        '''Columns d model / d p for each linear parameter p in param_names, shape (3N, P).
+        Must be called with the same z, r, phi as the factory (precomputed Bessel arrays).
+        Raises NotImplementedError for parameters without a fast column (caller falls back
+        to finite differences).'''
+        N = len(z)
+        if N != len(r):
+            raise ValueError('design_matrix needs the same points as the factory.')
+        z_ = z - z0
+        J = np.zeros((3*N, len(param_names)))
+        for col, p in enumerate(param_names):
+            model_r = np.zeros(N, dtype=np.float64)
+            model_z = np.zeros(N, dtype=np.float64)
+            model_phi = np.zeros(N, dtype=np.float64)
+            if p[1:4] == 'c1_':
+                m, n = [int(i) for i in p[4:].split('_')]
+                j = j_c1[n]
+                A, B, C, D = cyl_coef[p[0]]
+                calc_b_fields_cyl(z_, phi, r, cms1[m], n, f_r_m_n[m][j],
+                                  A, B, C, D, iv_c1[m][j], ivp_c1[m][j],
+                                  sinkz_c1[m], coskz_c1[m], sinnp_c1[j], cosnp_c1[j],
+                                  model_r, model_z, model_phi, eps)
+            elif p[1:4] == 'k0_':
+                n = int(p[4:])
+                j = j_k0[n]
+                E, F = (1., 0.) if p[0] == 'E' else (0., 1.)
+                calc_b_fields_k0(r, n, R_ref, E, F, sinnp_k0[j], cosnp_k0[j], model_r, model_phi)
+            elif p in k_names:
+                ks = [1. if k == p else 0. for k in k_names]
+                calc_b_fields_cart2(x, y, z_, phi, *ks, model_r, model_phi, model_z)
+            else:
+                raise NotImplementedError(f'No fast design matrix column for parameter {p}.')
+            J[:N, col] = model_r
+            J[N:2*N, col] = model_z
+            J[2*N:, col] = model_phi
+        return J
+
+    brzphi_3d_fast.design_matrix = design_matrix
+    return brzphi_3d_fast
