@@ -532,6 +532,90 @@ For now, assuming idealized case where there are no missing measurements
 TODO fix this -- build flexibility to handle missing measurements
 '''
 
+def _mu2e_plot3d_nonuniform_regular(df, x, y, z, X, Y, Z, mask_fit, mask_not_fit, conditions_title,
+                                    mode='mpl_nonuni', info=None, save_dir=None, save_name=None,
+                                    df_fit=None, ptype='3d', fig=None, ax=None, do_title=True,
+                                    title_simp=None, units='m', show_plot=True, df_fine=None,
+                                    legend=False):
+    '''mu2e_plot3d_nonuniform_test for a regular propeller grid (same R set on every Z slice), so
+    no SP/BP interpolation or Z shifting is needed. Same figure layout as the Mu2e version.'''
+    # wireframe: one row per Z (y), one column per signed R (x)
+    df_w = df.sort_values(by=[y, x])
+    n_per = df_w.groupby(y).size()
+    if n_per.nunique() != 1:
+        raise ValueError(f'Regular grid expected (same number of {x} per {y}); got {n_per.unique()}')
+    nx = int(n_per.iloc[0])
+    ny = int(len(df_w) / nx)
+    Xi = df_w[x].values.reshape(ny, nx)
+    Yi = df_w[y].values.reshape(ny, nx)
+    Z_fit = df_w[z+'_fit'].values.reshape(ny, nx)
+    # heat map of the residual (duplicate R=0 rows, e.g. phi and phi-pi on axis, are averaged)
+    if df_fine is None:
+        df_fine = df
+    df_fine = df_fine.eval(f'{z}_diff={z}-{z}_fit')
+    df_fine = df_fine.round({x: 9, y: 9})
+    piv_fine = df_fine.pivot_table(values=z+'_diff', index=x, columns=y)
+    X_fine = piv_fine.index.values
+    Y_fine = piv_fine.columns.values
+    dZ = np.transpose(piv_fine.values)
+    Xa = np.concatenate(([X_fine[0]], 0.5*(X_fine[1:]+X_fine[:-1]), [X_fine[-1]]))
+    Ya = np.concatenate(([Y_fine[0]], 0.5*(Y_fine[1:]+Y_fine[:-1]), [Y_fine[-1]]))
+
+    if save_dir:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        if save_name is None:
+            save_name = '{0}_{1}{2}_{3}'.format(
+                z, x, y, '_'.join([i for i in conditions_title.split(', ') if i != 'and']))
+            save_name = re.sub(r'[<>=!\s]', '', save_name)
+            if df_fit:
+                save_name += '_fit'
+
+    if not df_fit:
+        raise NotImplementedError('Regular-grid layout is only implemented for df_fit=True.')
+    if fig is None:
+        fig = plt.figure(figsize=plt.figaspect(0.4), layout='constrained')
+    gs = fig.add_gridspec(1, 20)
+    i_g = 11
+    ax = fig.add_subplot(gs[0, :i_g], projection='3d')
+    ax.plot(X[mask_fit], Y[mask_fit], Z[mask_fit], 'ko', alpha=1.0, markersize=2, zorder=101)
+    ax.plot(X[mask_not_fit], Y[mask_not_fit], Z[mask_not_fit], 'ro', alpha=0.5, markersize=2,
+            zorder=100, label='Excluded from fit')
+    ax.plot_wireframe(Xi, Yi, Z_fit, color='green', zorder=99)
+    if legend and (np.sum(mask_not_fit) > 0):
+        ax.legend(loc='upper right')
+    ax.set_xlabel(f'{x} ({units})', fontsize=18)
+    ax.set_ylabel(f'{y} ({units})', fontsize=18)
+    ax.set_zlabel(z+' (G)', fontsize=18)
+    ax.ticklabel_format(style='sci', axis='z')
+    ax.zaxis.labelpad = 20
+    ax.zaxis.set_tick_params(direction='out', pad=10)
+    ax.xaxis.labelpad = 20
+    ax.yaxis.labelpad = 20
+    if do_title:
+        if title_simp:
+            plt.title(title_simp, fontsize=20)
+        elif info is not None:
+            plt.title(f'{info} {z} vs {x} and {y}\n{conditions_title}', fontsize=20)
+        else:
+            plt.title('{0} vs {1} and {2}\n{3}'.format(z, x, y, conditions_title), fontsize=20)
+    ax.view_init(elev=30., azim=30)
+    ax2 = fig.add_subplot(gs[0, i_g:])
+    abs_max_val = np.nanmax(np.abs(dZ))
+    heat = ax2.pcolormesh(Xa, Ya, dZ, cmap=plt.get_cmap('viridis'), vmin=-abs_max_val, vmax=abs_max_val)
+    cb = plt.colorbar(heat, aspect=20)
+    plt.title('Residual, Data-Fit', fontsize=20)
+    cb.set_label('Data-Fit (G)', fontsize=18)
+    ax2.set_xlabel(f'{x} ({units})', fontsize=18)
+    ax2.set_ylabel(f'{y} ({units})', fontsize=18)
+    ax.dist = 11 # default 10
+    if save_dir:
+        plt.savefig(save_dir+'/'+save_name+'_heat.pdf')
+    if not show_plot:
+        plt.clf()
+    return fig, [ax, ax2]
+
+
 def mu2e_plot3d_nonuniform_test(df, x, y, z, conditions=None, mode='mpl', info=None, save_dir=None, save_name=None,
                                 df_fit=None, ptype='3d', aspect='square', cmin=None, cmax=None, fig=None, ax=None,
                                 do_title=True, title_simp=None, do2pi=False, units='mm',show_plot=True, df_fine=None, legend=False):
@@ -551,8 +635,23 @@ def mu2e_plot3d_nonuniform_test(df, x, y, z, conditions=None, mode='mpl', info=N
     Z = df[z]
 
     # mask for colors
-    mask_fit = df.fit_point
+    if 'fit_point' not in df.columns:
+        df = df.copy()
+        df.loc[:, 'fit_point'] = True
+    mask_fit = df.fit_point.astype(bool)
     mask_not_fit = ~mask_fit
+
+    # Mu2e FMS layout (SP / BP propellers on different Z ranges) vs a regular propeller grid
+    # (every Z slice has the same set of R, e.g. the HL-LHC-like multipole map: HP = r000mm, ...)
+    mu2e_FMS_layout = df['HP'].astype(str).str.contains('SP|BP').any()
+    if not mu2e_FMS_layout:
+        return _mu2e_plot3d_nonuniform_regular(df, x, y, z, X, Y, Z, mask_fit, mask_not_fit,
+                                               conditions_title if conditions else '', mode=mode,
+                                               info=info, save_dir=save_dir, save_name=save_name,
+                                               df_fit=df_fit, ptype=ptype, fig=fig, ax=ax,
+                                               do_title=do_title, title_simp=title_simp,
+                                               units=units, show_plot=show_plot, df_fine=df_fine,
+                                               legend=legend)
 
     zmax_SP = np.max(df[df['HP'].str.contains('SP')].Z)
     zmin_BP = np.min(df[df['HP'].str.contains('BP')].Z)
@@ -634,7 +733,8 @@ def mu2e_plot3d_nonuniform_test(df, x, y, z, conditions=None, mode='mpl', info=N
 
     df_fine = df_fine.eval(f'{z}_diff={z}-{z}_fit')
     #piv_fine = df_fine.pivot_table(z+'_diff',x,y)
-    piv_fine = df_fine.pivot_table(index=z+'_diff', columns=x, values=y)
+    # old positional call was pivot_table(values, index, columns)
+    piv_fine = df_fine.pivot_table(values=z+'_diff', index=x, columns=y)
     X_fine = piv_fine.index.values
     Y_fine = piv_fine.columns.values
     # DEBUG
@@ -1480,9 +1580,10 @@ def conditions_parser(df, conditions, do2pi=False):
 
     # Make radii negative for negative phi values (for plotting purposes)
     if phi is not None:
-        isc = np.isclose
+        # compare angles modulo 2 pi, so Phi = +pi matches phi - pi = -pi
+        isc = lambda a, b: np.isclose(np.abs(np.angle(np.exp(1j*(np.asarray(b) - a)))), 0.)
         nphi = phi + np.pi if do2pi else phi - np.pi
-        df = df[(isc(phi, df.Phi)) | (isc(nphi, df.Phi))]
+        df = df[(isc(phi, df.Phi)) | (isc(nphi, df.Phi))].copy()
         df.loc[isc(nphi, df.Phi), 'R'] *= -1
 
     conditions_title = conditions_nophi.replace(' and ', ', ')
