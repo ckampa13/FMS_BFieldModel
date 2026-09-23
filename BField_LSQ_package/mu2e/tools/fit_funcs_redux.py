@@ -32,6 +32,8 @@ import numexpr as ne
 from numba import vectorize, guvectorize, float64, int64, njit, prange
 from numba.types import UniTuple
 from math import cos, sin, factorial
+import os
+from concurrent.futures import ThreadPoolExecutor
 #import mpmath
 import six
 from six.moves import range, zip
@@ -5015,6 +5017,143 @@ def brzphi_3d_producer_giant_function_v1009(z, r, phi,
     return brzphi_3d_fast
 
 
+# v1010 helpers (module level)
+def _v1010_n_threads():
+    # threads for the Bessel setup; override with env MU2E_BESSEL_THREADS
+    n = os.environ.get('MU2E_BESSEL_THREADS')
+    return max(1, int(n)) if n else max(1, min(32, os.cpu_count() or 1))
+
+
+def _v1010_iv_ivp(cms, r, n_list, iv, ivp, n_threads=None):
+    '''Fill iv[m][j] = I_n(k_m r) and ivp[m][j] = I_n'(k_m r) for n = n_list[j], k_m = cms[m].
+    I_n' uses the exact identity I_n' = (I_{n-1} + I_{n+1})/2 (I_0' = I_1), which is what
+    scipy.special.ivp evaluates internally (two iv calls per ivp). Computing each needed order once
+    gives ~1 iv call per (m, n) instead of 3. scipy ufuncs release the GIL, so m is threaded.
+    Bit-identical to special.iv / special.ivp.'''
+    n_list = [int(n) for n in n_list]
+    if (len(cms) == 0) or (len(n_list) == 0):
+        return
+    orders = sorted(set(n_list) | {n+1 for n in n_list} | {abs(n-1) for n in n_list})
+    idx = {n: i for i, n in enumerate(orders)}
+    ords = np.array(orders, dtype=np.float64)[:, np.newaxis]
+
+    def one(m):
+        I = special.iv(ords, cms[m]*r[np.newaxis, :])
+        for j, n in enumerate(n_list):
+            iv[m][j] = I[idx[n]]
+            if n == 0:
+                ivp[m][j] = I[idx[1]]
+            else:
+                ivp[m][j] = 0.5*(I[idx[n-1]] + I[idx[n+1]])
+
+    n_threads = _v1010_n_threads() if n_threads is None else n_threads
+    if n_threads == 1:
+        for m in range(len(cms)):
+            one(m)
+    else:
+        with ThreadPoolExecutor(n_threads) as ex:
+            list(ex.map(one, range(len(cms))))
+
+
+# PAPER CALLS THIS LEFT HANDED
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_helR(z, phi, r, hms, n, A, B, iv, ivp, model_r, model_z, model_phi):
+    for i in prange(z.shape[0]):
+        model_r[i] += hms * \
+            (ivp[i]*(A*np.cos(hms*z[i]+n*phi[i]) +
+                     B*np.sin(hms*z[i]+n*phi[i])))
+
+        model_z[i] += hms * \
+            (iv[i]*(-A*np.sin(hms*z[i]+n*phi[i]) +
+                    B*np.cos(hms*z[i]+n*phi[i])))
+        if abs(r[i]) >= 1e-5:
+            model_phi[i] += (1.0/r[i]) * \
+                -(n*iv[i]*(A*np.sin(hms*z[i]+n*phi[i]) -
+                           B*np.cos(hms*z[i]+n*phi[i])))
+
+# PAPER CALLS THIS RIGHT HANDED
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_helL(z, phi, r, hms, n, C, D, iv, ivp, model_r, model_z, model_phi):
+    for i in prange(z.shape[0]):
+        model_r[i] += hms * \
+            (ivp[i]*(C*np.cos(-hms*z[i]+n*phi[i]) +
+                     D*np.sin(-hms*z[i]+n*phi[i])))
+
+        model_z[i] += -hms * \
+            (iv[i]*(-C*np.sin(-hms*z[i]+n*phi[i]) +
+                    D*np.cos(-hms*z[i]+n*phi[i])))
+
+        if abs(r[i]) >= 1e-5:
+            model_phi[i] += (1.0/r[i]) * \
+                -(n*iv[i]*(C*np.sin(-hms*z[i]+n*phi[i]) -
+                           D*np.cos(-hms*z[i]+n*phi[i])))
+
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_cyl(z, phi, r, cms, n, f_r, A, B, C, D, iv, ivp, sinkz, coskz, sinnp, cosnp, model_r, model_z, model_phi, eps):
+    for i in prange(z.shape[0]):
+        if n > 0:
+            model_r[i] += ivp[i]*cms*(A*coskz[i]*cosnp[i] + B*sinkz[i]*cosnp[i] + C*coskz[i]*sinnp[i] + D*sinkz[i]*sinnp[i])
+            model_z[i] += iv[i] *cms*(-A*sinkz[i]*cosnp[i] + B*coskz[i]*cosnp[i] - C*sinkz[i]*sinnp[i] + D*coskz[i]*sinnp[i])
+            if cms*r[i] >= eps:
+                model_phi[i] += n*(1/r[i])*iv[i]*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+            else:
+                if n==1:
+                    ffac = cms/2. # approx
+                else:
+                    ffac = f_r[i]
+                model_phi[i] += ffac*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+        else:
+            model_r[i] += ivp[i]*cms*(A*coskz[i] + B*sinkz[i])
+            model_z[i] += iv[i]*cms*(-A*sinkz[i] + B*coskz[i])
+
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_k0(r, n, R_ref, E, F, sinnp, cosnp, model_r, model_phi):
+    for i in prange(r.shape[0]):
+        rn = (r[i]/R_ref)**(n-1)
+        model_r[i] += rn*(E*cosnp[i] + F*sinnp[i])
+        model_phi[i] += rn*(-E*sinnp[i] + F*cosnp[i])
+
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_cyl2(z, phi, r, cms, n, A, B, D, jv, jvp, model_r, model_z, model_phi):
+    for i in prange(z.shape[0]):
+        model_r[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
+            jvp[i]*cms*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
+
+        model_z[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
+            jv[i]*cms*(A*np.cosh(cms*z[i]) + B*np.sinh(cms*z[i]))
+        if abs(r[i]) >= 1e-5:
+            model_phi[i] += n*(D*np.cos(n*phi[i]) - (1-D)*np.sin(n*phi[i])) * \
+                (1/r[i])*jv[i]*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
+
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_cart(x, y, z, phi, vx, vy, vz, x0, y0, z0,
+                       model_r, model_phi, model_z):
+    for i in prange(z.shape[0]):
+        v = np.array([vx, vy, vz])
+        r = np.array([x[i]-x0, y[i]-y0, z[i]-z0])
+        rsq = np.linalg.norm(r)**2
+        res = np.array([v[1]*r[2]-v[2]*r[1], v[2]*r[0]-v[0]*r[2],
+                        v[0]*r[1]-v[1]*r[0]])/rsq
+        model_xt, model_yt, model_zt = res
+
+        model_z[i] += model_zt
+        model_r[i] += model_xt*np.cos(phi[i]) + model_yt*np.sin(phi[i])
+        model_phi[i] += -model_xt*np.sin(phi[i]) + model_yt*np.cos(phi[i])
+
+@njit(parallel=True, cache=True)
+def _v1010_calc_b_fields_cart2(x, y, z, phi, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                        model_r, model_phi, model_z):
+    for i in prange(z.shape[0]):
+        # Kampa
+        model_x = k1 + k4*y[i] + k5*z[i] + k7*y[i]*z[i]
+        model_y = k2 + k4*x[i] + k6*z[i] + k7*x[i]*z[i]
+
+        model_z[i] += k3 + k5*x[i] + k6*y[i] + k7*x[i]*y[i]
+
+        model_r[i] += model_x*np.cos(phi[i]) + model_y*np.sin(phi[i])
+        model_phi[i] += -model_x*np.sin(phi[i]) + model_y*np.cos(phi[i])
+
+
 # v1008 + k=0 (z-independent, pure 2D) multipole terms, optional subset of Bessel orders,
 # and a fast design matrix for the linear solver (FieldFitter method='linear')
 def brzphi_3d_producer_giant_function_v1010(z, r, phi,
@@ -5103,9 +5242,8 @@ def brzphi_3d_producer_giant_function_v1010(z, r, phi,
         cms1[m] = (2*(m+1)*np.pi/length1)
         sinkz_c1[m] = np.sin(cms1[m]*z_)
         coskz_c1[m] = np.cos(cms1[m]*z_)
-        for j, n in enumerate(n_list_c1):
-            iv_c1[m][j] = special.iv(n, cms1[m]*r)
-            ivp_c1[m][j] = special.ivp(n, cms1[m]*r)
+    # I_n and I_n' for all (m, n): one iv call per order (I_n' from the exact identity), threaded over m
+    _v1010_iv_ivp(cms1, r, n_list_c1, iv_c1, ivp_c1)
     # first order correction for small r (Bphi ~ I_n(kr)/r), as in v1008:
     # n=1 -> k/2; n>=2 -> n k^n r^(n-1) / (2^n n!). f_r < 0 flags "not needed".
     eps = 1e-7
@@ -5145,103 +5283,14 @@ def brzphi_3d_producer_giant_function_v1010(z, r, phi,
             jv_c2[m_c2][n_c2] = special.jv(n_c2, cms2[n_c2][m_c2]*r)
             jvp_c2[m_c2][n_c2] = special.jvp(n_c2, cms2[n_c2][m_c2]*r)
 
-    # PAPER CALLS THIS LEFT HANDED
-    @njit(parallel=True)
-    def calc_b_fields_helR(z, phi, r, hms, n, A, B, iv, ivp, model_r, model_z, model_phi):
-        for i in prange(z.shape[0]):
-            model_r[i] += hms * \
-                (ivp[i]*(A*np.cos(hms*z[i]+n*phi[i]) +
-                         B*np.sin(hms*z[i]+n*phi[i])))
-
-            model_z[i] += hms * \
-                (iv[i]*(-A*np.sin(hms*z[i]+n*phi[i]) +
-                        B*np.cos(hms*z[i]+n*phi[i])))
-            if abs(r[i]) >= 1e-5:
-                model_phi[i] += (1.0/r[i]) * \
-                    -(n*iv[i]*(A*np.sin(hms*z[i]+n*phi[i]) -
-                               B*np.cos(hms*z[i]+n*phi[i])))
-
-    # PAPER CALLS THIS RIGHT HANDED
-    @njit(parallel=True)
-    def calc_b_fields_helL(z, phi, r, hms, n, C, D, iv, ivp, model_r, model_z, model_phi):
-        for i in prange(z.shape[0]):
-            model_r[i] += hms * \
-                (ivp[i]*(C*np.cos(-hms*z[i]+n*phi[i]) +
-                         D*np.sin(-hms*z[i]+n*phi[i])))
-
-            model_z[i] += -hms * \
-                (iv[i]*(-C*np.sin(-hms*z[i]+n*phi[i]) +
-                        D*np.cos(-hms*z[i]+n*phi[i])))
-
-            if abs(r[i]) >= 1e-5:
-                model_phi[i] += (1.0/r[i]) * \
-                    -(n*iv[i]*(C*np.sin(-hms*z[i]+n*phi[i]) -
-                               D*np.cos(-hms*z[i]+n*phi[i])))
-
-    @njit(parallel=True)
-    def calc_b_fields_cyl(z, phi, r, cms, n, f_r, A, B, C, D, iv, ivp, sinkz, coskz, sinnp, cosnp, model_r, model_z, model_phi, eps):
-        for i in prange(z.shape[0]):
-            if n > 0:
-                model_r[i] += ivp[i]*cms*(A*coskz[i]*cosnp[i] + B*sinkz[i]*cosnp[i] + C*coskz[i]*sinnp[i] + D*sinkz[i]*sinnp[i])
-                model_z[i] += iv[i] *cms*(-A*sinkz[i]*cosnp[i] + B*coskz[i]*cosnp[i] - C*sinkz[i]*sinnp[i] + D*coskz[i]*sinnp[i])
-                if cms*r[i] >= eps:
-                    model_phi[i] += n*(1/r[i])*iv[i]*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
-                else:
-                    if n==1:
-                        ffac = cms/2. # approx
-                    else:
-                        ffac = f_r[i]
-                    model_phi[i] += ffac*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
-            else:
-                model_r[i] += ivp[i]*cms*(A*coskz[i] + B*sinkz[i])
-                model_z[i] += iv[i]*cms*(-A*sinkz[i] + B*coskz[i])
-
-    @njit(parallel=True)
-    def calc_b_fields_k0(r, n, R_ref, E, F, sinnp, cosnp, model_r, model_phi):
-        for i in prange(r.shape[0]):
-            rn = (r[i]/R_ref)**(n-1)
-            model_r[i] += rn*(E*cosnp[i] + F*sinnp[i])
-            model_phi[i] += rn*(-E*sinnp[i] + F*cosnp[i])
-
-    @njit(parallel=True)
-    def calc_b_fields_cyl2(z, phi, r, cms, n, A, B, D, jv, jvp, model_r, model_z, model_phi):
-        for i in prange(z.shape[0]):
-            model_r[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
-                jvp[i]*cms*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
-
-            model_z[i] += (D*np.sin(n*phi[i]) + (1-D)*np.cos(n*phi[i])) * \
-                jv[i]*cms*(A*np.cosh(cms*z[i]) + B*np.sinh(cms*z[i]))
-            if abs(r[i]) >= 1e-5:
-                model_phi[i] += n*(D*np.cos(n*phi[i]) - (1-D)*np.sin(n*phi[i])) * \
-                    (1/r[i])*jv[i]*(A*np.sinh(cms*z[i]) + B*np.cosh(cms*z[i]))
-
-    @njit(parallel=True)
-    def calc_b_fields_cart(x, y, z, phi, vx, vy, vz, x0, y0, z0,
-                           model_r, model_phi, model_z):
-        for i in prange(z.shape[0]):
-            v = np.array([vx, vy, vz])
-            r = np.array([x[i]-x0, y[i]-y0, z[i]-z0])
-            rsq = np.linalg.norm(r)**2
-            res = np.array([v[1]*r[2]-v[2]*r[1], v[2]*r[0]-v[0]*r[2],
-                            v[0]*r[1]-v[1]*r[0]])/rsq
-            model_xt, model_yt, model_zt = res
-
-            model_z[i] += model_zt
-            model_r[i] += model_xt*np.cos(phi[i]) + model_yt*np.sin(phi[i])
-            model_phi[i] += -model_xt*np.sin(phi[i]) + model_yt*np.cos(phi[i])
-
-    @njit(parallel=True)
-    def calc_b_fields_cart2(x, y, z, phi, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
-                            model_r, model_phi, model_z):
-        for i in prange(z.shape[0]):
-            # Kampa
-            model_x = k1 + k4*y[i] + k5*z[i] + k7*y[i]*z[i]
-            model_y = k2 + k4*x[i] + k6*z[i] + k7*x[i]*z[i]
-
-            model_z[i] += k3 + k5*x[i] + k6*y[i] + k7*x[i]*y[i]
-
-            model_r[i] += model_x*np.cos(phi[i]) + model_y*np.sin(phi[i])
-            model_phi[i] += -model_x*np.sin(phi[i]) + model_y*np.cos(phi[i])
+    # numba kernels live at module level (compiled once, cached on disk)
+    calc_b_fields_helR = _v1010_calc_b_fields_helR
+    calc_b_fields_helL = _v1010_calc_b_fields_helL
+    calc_b_fields_cyl = _v1010_calc_b_fields_cyl
+    calc_b_fields_k0 = _v1010_calc_b_fields_k0
+    calc_b_fields_cyl2 = _v1010_calc_b_fields_cyl2
+    calc_b_fields_cart = _v1010_calc_b_fields_cart
+    calc_b_fields_cart2 = _v1010_calc_b_fields_cart2
 
     def brzphi_3d_fast(z, r, phi, x, y, **AB_params):
         """ 3D model for Bz Br and Bphi vs Z and R. Can take any number of AnBn terms."""

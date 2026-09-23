@@ -139,3 +139,18 @@ def test_degeneracy_guard(tmp_path):
     ffit.pickle_path = str(tmp_path) + '/'
     with pytest.raises(ValueError, match='degenerate'):
         ffit.fit(cp, cfg_pickle(False, False, 'x', 'x', False))
+
+
+@pytest.mark.parametrize('n_list', [[0, 1, 2, 3], [0, 1, 2, 3, 4, 5, 6, 10, 14], [2, 6, 10]])
+@pytest.mark.parametrize('n_threads', [1, 8])
+def test_v1010_bessel_setup_bit_identical(n_list, n_threads):
+    from scipy import special
+    z, r, phi, x, y = points(N=500)
+    cms = 2*np.pi*(np.arange(7)+1)/L
+    iv = np.zeros((len(cms), len(n_list), len(r)))
+    ivp = np.zeros_like(iv)
+    ff._v1010_iv_ivp(cms, r, n_list, iv, ivp, n_threads=n_threads)
+    for m in range(len(cms)):
+        for j, n in enumerate(n_list):
+            assert np.array_equal(iv[m][j], special.iv(n, cms[m]*r))
+            assert np.array_equal(ivp[m][j], special.ivp(n, cms[m]*r))
