@@ -5,7 +5,7 @@ import tensorflow as tf
 from BFieldPINN.NN_callbacks import register_x_sin2x_func
 
 class ScalarPINN(tf.keras.Model):
-    def __init__(self, norm_dict, x_u, y_u, z_u, validation_data, validation_labels, u_labels, layers_in, activ, snake_a=5., lambda_=0.5,
+    def __init__(self, norm_dict, x_u, y_u, z_u, validation_data, validation_labels, u_labels, layers_in, activ, snake_a=5., snake_f=1./2., snake_D=1., lambda_=0.5,
                  reg=0.0, N_f=50000, tracking_data=None, track_stride=10, initializer=None,
                  colloc_seed=None):
         super(ScalarPINN, self).__init__()
@@ -46,6 +46,8 @@ class ScalarPINN(tf.keras.Model):
         # activation function, hyperparameter setup
         self.activ = activ
         self.snake_a = snake_a
+        self.snake_f = snake_f
+        self.snake_D = snake_D
         self.activ_name = None
         if self.activ=='tanh':
             activation_func = tf.keras.activations.tanh
@@ -53,7 +55,7 @@ class ScalarPINN(tf.keras.Model):
             activation_func = tf.keras.activations.gelu
         elif self.activ=='x_sin2x':
             # register the correct function
-            self.activ_name = register_x_sin2x_func(a=self.snake_a)
+            self.activ_name = register_x_sin2x_func(a=self.snake_a, f=self.snake_f, D=self.snake_D)
             activation_func = tf.keras.utils.get_custom_objects()[self.activ_name]
         self.lambda_ = tf.Variable(0.0, dtype='float32', trainable=False)
         self.lambda_init = lambda_
@@ -228,6 +230,8 @@ class ScalarPINN(tf.keras.Model):
             'layers_in': self.layers_in,
             'activ': self.activ,
             'snake_a': self.snake_a,
+            'snake_f': self.snake_f,
+            'snake_D': self.snake_D,
             'lambda_': self.lambda_,
             'reg': self.reg,
             'N_f': self.N_f,

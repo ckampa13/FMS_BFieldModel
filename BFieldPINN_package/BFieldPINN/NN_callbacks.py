@@ -80,13 +80,15 @@ def register_x_sin2x_func(a=1):
 '''
 
 # smarter modification: f(x) = C x + D sin^2 a
-def register_x_sin2x_func(a=1):
+#def register_x_sin2x_func(a=1):
+def register_x_sin2x_func(a=1, f=1./2., D=1.):
+
     #f = 1./3. # both tests -- matches old case when a=2
-    f = 1./2. # both tests -- close to old case when a=5
+    #f = 1./2. # both tests -- close to old case when a=5
     #f = 0.1
     # f = 0.0 # original snake
     # D = 1./a # original snake
-    D = 1 # test 2 (1_28)
+    #D = 1 # test 2 (1_28)
     # D = 2 # TEMP
     C = D * a * (1 - f) / (1 + f)
     ###

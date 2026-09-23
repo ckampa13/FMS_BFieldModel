@@ -162,6 +162,8 @@ def prep_PINN_inputs(files_dict, NN_dict):
     # activation, lamdba, regularization
     activ = NN_dict['activ']
     snake_a = NN_dict['snake_a']
+    snake_f = NN_dict['snake_f']
+    snake_D = NN_dict['snake_D']
     lambda_ = NN_dict['lambda_']
     reg = NN_dict['reg']
     # number of collocation points
@@ -182,7 +184,8 @@ def prep_PINN_inputs(files_dict, NN_dict):
     init_config = {}
     config_keys = [
         'norm_dict', 'x_u', 'y_u', 'z_u', 'validation_data', 'validation_labels',
-        'u_labels', 'layers_in', 'activ', 'snake_a', 'lambda_', 'reg',
+        'u_labels', 'layers_in', 'activ', 'snake_a', 'snake_f', 'snake_D',
+        'lambda_', 'reg',
         'N_f', 'tracking_data', 'track_stride', 'initializer', 'colloc_seed',
     ]
     for k in config_keys:

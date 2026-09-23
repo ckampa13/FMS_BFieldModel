@@ -1,9 +1,8 @@
 name: helicalc
 channels:
-  - bjornfjohansson
-  - pytorch
   - conda-forge
   - defaults
+  - pytorch
 dependencies:
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=1_llvm
@@ -13,12 +12,12 @@ dependencies:
   - bleach=3.1.5=pyh9f0ad1d_0
   - brotli-python=1.0.9=py38h709712a_6
   - bzip2=1.0.8=h516909a_3
-  - ca-certificates=2021.10.8=ha878542_0
-  - certifi=2021.10.8=py38h578d9bd_1
+  - ca-certificates=2026.7.22=hbd8a1cb_0
+  - certifi=2024.8.30=pyhd8ed1ab_0
   - click=8.0.3=py38h578d9bd_1
   - cudatoolkit=10.2.89=hfd86e86_1
   - cycler=0.10.0=py_2
-  - dash=2.9.1
+  - dash=2.9.1=pyhd8ed1ab_0
   - dash-table=4.4.1=pyhd3eb1b0_0
   - dataclasses=0.8=pyhc8e2a94_3
   - dbus=1.13.6=he372182_0
@@ -69,6 +68,8 @@ dependencies:
   - libclang=9.0.1=default_hde54327_0
   - libffi=3.2.1=he1b5a44_1007
   - libgcc-ng=11.2.0=h1d223b6_11
+  - libgfortran-ng=7.5.0=h14aa051_20
+  - libgfortran4=7.5.0=h14aa051_20
   - libiconv=1.15=h516909a_1006
   - libllvm9=9.0.1=he513fc3_1
   - libpng=1.6.37=hed695b0_1
@@ -95,7 +96,7 @@ dependencies:
   - mkl-service=2.3.0=py38h516909a_0
   - mkl_fft=1.1.0=py38hc1659b7_1
   - mkl_random=1.1.0=py38hb3f55d8_0
-  - mpldatacursor=0.7.1=py_0
+  - mpldatacursor=0.7.1=pyhd8ed1ab_0
   - nbconvert=5.6.1=py38h32f6830_1
   - nbformat=5.0.7=py_0
   - ncurses=6.2=he1b5a44_1
@@ -108,7 +109,7 @@ dependencies:
   - numpy-base=1.18.5=py38hde5b4d6_0
   - olefile=0.46=py_0
   - openh264=2.1.1=h8b12597_0
-  - openssl=1.1.1l=h7f98852_0
+  - openssl=1.1.1o=h166bdaf_0
   - packaging=20.4=pyh9f0ad1d_0
   - pandas=1.1.2=py38h950e882_0
   - pandoc=2.10=h14c3975_0
@@ -172,12 +173,13 @@ dependencies:
   - zlib=1.2.11=h36c2ea0_1013
   - zstd=1.4.5=h6597ccf_1
   - pip:
-    - asteval==0.9.18
-    - dill==0.3.4
-    - future==0.18.2
-    - lmfit==1.0.1
-    - pypdt==0.8.0
-    - pyqt5-sip==4.19.18
-    - pyqtchart==5.12
-    - pyqtwebengine==5.12.1
-    - uncertainties==2.4.4
+      - asteval==0.9.18
+      - dill==0.3.4
+      - future==0.18.2
+      - lmfit==1.0.1
+      - pypdt==0.8.0
+      - pyqt5==5.12.3
+      - pyqt5-sip==4.19.18
+      - pyqtchart==5.12
+      - uncertainties==3.2.3
+prefix: /home/ckampa/anaconda3/envs/helicalc

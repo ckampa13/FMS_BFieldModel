@@ -31,12 +31,20 @@ import numpy as np
 import numexpr as ne
 from numba import vectorize, guvectorize, float64, int64, njit, prange
 from numba.types import UniTuple
-from math import cos, sin
+from math import cos, sin, factorial
 #import mpmath
 import six
 from six.moves import range, zip
+#from collections import defaultdict
 
 guvec_target = 'cuda' # 'parallel'
+
+# for first order correction logic
+class filler:
+    def get(self, i, j=None):
+        if j is None:
+            return -1
+        return j
 
 
 def pairwise(iterable):
@@ -4431,6 +4439,48 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
         for n in range(ns_c1):
             iv_c1[m][n] = special.iv(n, cms1[m]*r)
             ivp_c1[m][n] = special.ivp(n, cms1[m]*r)
+    # first order correction for small r
+    #ns = np.arange(ns_c1)
+    #factorial_ns = np.array([factorial(n) for n in range(ns_c1)])
+    #f_r_m_n = cms1[m] * r**(n-1) / (2.**n * factorial(n-1))
+    eps = 1e-7
+    # defaultdict (not JIT safe)
+    # f_r_m_n = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    # only add the values we need (typically sparse, unless input df has a lot of field points with small r)
+    #cms_r = cms1[:, np.newaxis] * r[np.newaxis, :]
+    # ms_flat = (np.arange(ms_c1, dtype=int)[:, np.newaxis]*np.ones(cms_r.shape[1], dtype=int)[np.newaxis, :])[cms_r < eps]
+    # ks_flat = (np.arange(len(r), dtype=int)[np.newaxis, :]*np.ones(cms_r.shape[0], dtype=int)[:, np.newaxis])[cms_r < eps]
+    # # loop through only relevant elements
+    # for m, k in zip(ms_flat, ks_flat):
+    #     for n in range(2, ns_c1):
+    #         f_r_m_n[m][n][k] = n * cms1[m]**n * r[k]**(n-1) / (2.**n * factorial(n))
+
+    # cleanup
+    # del(cms_r)
+    # del(ms_flat)
+    # del(ks_flat)
+
+    # dense array
+    ks = np.arange(len(r))
+    cms_r = cms1[:, np.newaxis] * r[np.newaxis, :]
+    f_r_m_n = np.zeros((ms_c1, ns_c1, len(r))) - 1
+    for m in range(ms_c1):
+        cms = cms1[m]
+        m_ = (cms_r[m] < eps)
+        for k, r_ in zip(ks[m_], r[m_]):
+            for n in range(2, ns_c1):
+                f_r_m_n[m][n][k] = n * cms**n * r_**(n-1) / (2.**n * factorial(n))
+
+    print('\n\n')
+    print(f'number f_r_m_n > 0: {(f_r_m_n > 0).sum()}')
+    print(f'number f_r_m_n < 0: {(f_r_m_n < 0).sum()}')
+    print(f'f_r_m_n.size: {f_r_m_n.size}\n\n')
+
+    # cleanup
+    del(cms_r)
+    del(ks)
+    del(m_)
+
 
     jv_c2 = np.zeros((ms_c2, ns_c2, len(r)))
     jvp_c2 = np.zeros((ms_c2, ns_c2, len(r)))
@@ -4478,16 +4528,31 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
                                D*np.cos(-hms*z[i]+n*phi[i])))
 
     @njit(parallel=True)
-    def calc_b_fields_cyl(z, phi, r, cms, n, A, B, C, D, iv, ivp, sinkz, coskz, sinnp, cosnp, model_r, model_z, model_phi):
+    def calc_b_fields_cyl(z, phi, r, cms, n, f_r, A, B, C, D, iv, ivp, sinkz, coskz, sinnp, cosnp, model_r, model_z, model_phi, eps):
         for i in prange(z.shape[0]):
             if n > 0:
                 model_r[i] += ivp[i]*cms*(A*coskz[i]*cosnp[i] + B*sinkz[i]*cosnp[i] + C*coskz[i]*sinnp[i] + D*sinkz[i]*sinnp[i])
                 model_z[i] += iv[i] *cms*(-A*sinkz[i]*cosnp[i] + B*coskz[i]*cosnp[i] - C*sinkz[i]*sinnp[i] + D*coskz[i]*sinnp[i])
-                if abs(r[i]) >= 1e-5:
+                ###if abs(r[i]) >= 1e-7:
+                if cms*r[i] >= eps:
+                #     model_phi[i] += n*(1/r[i])*iv[i]*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+                # elif n == 1:
+                #     #model_phi[i] += n*np.cos(n*phi[i]+D)*cms/2*(A*np.cos(cms*z[i]) + B*np.sin(cms*z[i]))
+                #     model_phi[i] += cms/2*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+                ##if abs(cms*r[i]) >= eps:
+                # if f_r_m_n.get(i,-1) < 0: # this is equiv to epsilon test (in how we pass in default f_r_m_n) --> not JIT compatible
+                #if abs(cms_r[i]) >= eps:
+                ###if f_r[i] < 0: # equiv to epsilon cut based on setup of f
                     model_phi[i] += n*(1/r[i])*iv[i]*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
-                elif n == 1:
-                    #model_phi[i] += n*np.cos(n*phi[i]+D)*cms/2*(A*np.cos(cms*z[i]) + B*np.sin(cms*z[i]))
-                    model_phi[i] += cms/2*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
+                else:
+                    if n==1:
+                        ffac = cms/2. # approx
+                    else:
+                        #f = cms_to_n * r_to_nm1[i] / (2.**n * factorial(n-1)) # approx -- moved above to avoid recalculating
+                        ffac = f_r[i]
+                        # if something went wrong and index isn't there (it should be), default to add zero contribution
+                        # f = f_r_m_n.get(i, 0.)
+                    model_phi[i] += ffac*(-A*coskz[i]*sinnp[i] - B*sinkz[i]*sinnp[i] + C*coskz[i]*cosnp[i] + D*sinkz[i]*cosnp[i])
             else:
                 model_r[i] += ivp[i]*cms*(A*coskz[i] + B*sinkz[i])
                 model_z[i] += iv[i]*cms*(-A*sinkz[i] + B*coskz[i])
@@ -4580,11 +4645,16 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
                 C = AB_params[f'Cc1_{m}_{n}']
                 #D = AB_params[f'Dc1_{n}']
                 D = AB_params[f'Dc1_{m}_{n}']
-                calc_b_fields_cyl(z_, phi, r, cms1[m], n, A, B, C, D, iv_c1[m][n], ivp_c1[m][n],
+                calc_b_fields_cyl(z_, phi, r, cms1[m], n,
+                                  #f_r_m_n.get(m, {}).get(n, filler()),
+                                  f_r_m_n[m][n],
+                                  A, B, C, D, iv_c1[m][n], ivp_c1[m][n],
                                   #sinkz, coskz,
                                   sinkz_c1[m], coskz_c1[m],
                                   sinnp_c1[n], cosnp_c1[n],
-                                  model_r, model_z, model_phi)
+                                  model_r, model_z, model_phi,
+                                  eps,
+                                  )
 
         for m in range(ms_c2):
             for n in range(ns_c2):
