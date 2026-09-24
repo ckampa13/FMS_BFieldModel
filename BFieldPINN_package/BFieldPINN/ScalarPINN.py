@@ -69,6 +69,10 @@ class ScalarPINN(tf.keras.Model):
             self.initializer = initializer
 
         self.colloc_seed = colloc_seed
+        # op seeds for the z, r, theta draws of the collocation points. With a fixed colloc_seed the three
+        # draws must use different op seeds (the same seed gives identical draws -> all points on one
+        # spiral). colloc_seed=None keeps seed=None for all three, exactly as before.
+        self._colloc_seeds = (None, None, None) if colloc_seed is None else (colloc_seed, colloc_seed + 1, colloc_seed + 2)
 
         # set up network
         self.layers_in = layers_in
@@ -112,10 +116,10 @@ class ScalarPINN(tf.keras.Model):
 
         # FIXME! This should be passed in as a generator function that returns x_f, y_f, z_f so that different geometries can be used.
         # generate collocation points -- cylindrical
-        self.z_f = tf.random.uniform(minval=-L, maxval=L, shape=(self.N_f, 1), seed=self.colloc_seed) + self.Z0
+        self.z_f = tf.random.uniform(minval=-L, maxval=L, shape=(self.N_f, 1), seed=self._colloc_seeds[0]) + self.Z0
         # R, theta --> x, y
-        rs = R * tf.math.sqrt(tf.random.uniform(minval=0, maxval=1, shape=(self.N_f, 1), seed=self.colloc_seed))
-        ths = tf.random.uniform(minval=0, maxval=2*math.pi, shape=(self.N_f, 1), seed=self.colloc_seed)
+        rs = R * tf.math.sqrt(tf.random.uniform(minval=0, maxval=1, shape=(self.N_f, 1), seed=self._colloc_seeds[1]))
+        ths = tf.random.uniform(minval=0, maxval=2*math.pi, shape=(self.N_f, 1), seed=self._colloc_seeds[2])
         self.x_f = rs * tf.math.cos(ths) + self.X0
         self.y_f = rs * tf.math.sin(ths) + self.Y0
 
