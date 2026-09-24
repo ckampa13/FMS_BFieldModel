@@ -27,7 +27,7 @@ OUTDIR = os.path.join(helicalc_data, 'Bmaps', 'multipole', '')
 
 
 def make_region(name, geom, dxy=0.020, dz=0.020, radii=None, nphi=32,
-                dedupe_axis=True, offset=False):
+                dedupe_axis=True, offset=False, z_range=None, z_subdiv=1):
     '''Field-point DataFrame for a named region.
 
     dxy, dz         Cartesian grid steps for the 'map' region [m]
@@ -44,8 +44,21 @@ def make_region(name, geom, dxy=0.020, dz=0.020, radii=None, nphi=32,
                     row per z for it (the truth field there is identical);
                     downstream, replicate that row nphi times if you want nphi
                     independent noisy readings.  False emits all nphi.
+    z_range         (z0, z1) [m]; default MAPPING_VOLUME.  The 'map' grid keeps
+                    its half-step offset relative to z0.
+    z_subdiv        split each 'measurement' z step into this many planes
+                    (default 1).  Must be odd: an even split puts a plane at
+                    z0 + dz/2 (mod dz), i.e. on the offset 'map' test planes.
     '''
-    R, z0, z1 = geom.R_map, MAPPING_VOLUME['z0'], MAPPING_VOLUME['z1']
+    R = geom.R_map
+    z0, z1 = MAPPING_VOLUME['z0'], MAPPING_VOLUME['z1']
+    if z_range is not None:
+        z0, z1 = float(z_range[0]), float(z_range[1])
+        if not z1 > z0:
+            raise ValueError('z_range must be increasing: %r' % (z_range,))
+    z_subdiv = int(z_subdiv)
+    if z_subdiv < 1:
+        raise ValueError('z_subdiv must be >= 1')
     if name == 'measurement':
         # Propeller sampling (handoff sec 6): probes at fixed radii on a rotating
         # arm, stepped along z.  nphi = 32 matters -- with 16 the n = 10 content
@@ -53,7 +66,21 @@ def make_region(name, geom, dxy=0.020, dz=0.020, radii=None, nphi=32,
         if radii is None:
             radii = [0.0, 0.020, 0.040, 0.060]
         radii = [r for r in radii if r <= R + 1e-9]
-        zs = np.arange(z0, z1 + 1e-9, dz)
+        if z_range is None and z_subdiv == 1:
+            # legacy grid, kept bit-for-bit so existing datasets stay comparable
+            zs = np.arange(z0, z1 + 1e-9, dz)
+        else:
+            # integer plane index, no float-arange drift
+            step = dz / z_subdiv
+            n = int(np.floor((z1 - z0) / step + 1e-6)) + 1
+            zs = np.round(z0 + np.arange(n) * step, 9)
+            # no plane may sit on an offset 'map' test plane z0 + dz/2 + j*dz
+            frac = np.mod(zs - z0 - 0.5 * dz, dz)
+            clash = np.minimum(frac, dz - frac) < 1e-6
+            if clash.any():
+                raise ValueError('z_subdiv=%d puts %d measurement planes on the '
+                                 'offset map planes (use an odd split)'
+                                 % (z_subdiv, clash.sum()))
         ph = 2 * np.pi * np.arange(nphi) / nphi
         frames = []
         for r in radii:
@@ -140,6 +167,15 @@ def main(argv=None):
     p.add_argument('--offset-map', action='store_true',
                    help="shift region 'map' by half a z step so the test sample "
                         'does not reuse measurement locations')
+    p.add_argument('--z-range', default=None,
+                   help='z0,z1 in M for the region (default: MAPPING_VOLUME, '
+                        '0,8.6)')
+    p.add_argument('--z-subdiv', type=int, default=1,
+                   help="split each 'measurement' z step into K planes; K must "
+                        'be odd (default 1)')
+    p.add_argument('--name-tag', default='',
+                   help='appended to the output name, e.g. Z1p9to5p1_k3_phi64, '
+                        'so a non-default grid never overwrites a default one')
     p.add_argument('--keep-axis-copies', action='store_true',
                    help='emit all nphi rows for an on-axis probe instead of one')
     p.add_argument('--aperture', type=float, default=0.150)
@@ -172,10 +208,16 @@ def main(argv=None):
             bars = bars.iloc[np.sort(mine)].reset_index(drop=True)
 
         radii = [float(v) / 1e3 for v in args.radii.split(',') if v.strip()]
+        z_range = None
+        if args.z_range:
+            z_range = [float(v) for v in args.z_range.split(',')]
+            if len(z_range) != 2:
+                raise SystemExit('--z-range takes z0,z1')
         df = make_region(args.Region, geom, dxy=args.dxy, dz=args.dz,
                          radii=radii, nphi=args.nphi,
                          dedupe_axis=not args.keep_axis_copies,
-                         offset=args.offset_map)
+                         offset=args.offset_map, z_range=z_range,
+                         z_subdiv=args.z_subdiv)
         if args.Testing.strip() == 'y':
             df = df.iloc[:500].copy().reset_index(drop=True)
         suff = ''
@@ -188,6 +230,8 @@ def main(argv=None):
         out = add_field(df, bars, dev=args.Device, per_element=args.per_element)
 
         tag = '' if args.Element is None else '_' + args.Element
+        if args.name_tag:
+            tag += '_' + args.name_tag
         name = '%s.%s_region%s%s.GPU%d_of_%d.pkl' % (
             args.Geom, args.Region, tag, suff, args.Device, args.NDevices)
         path = os.path.join(OUTDIR, name)
