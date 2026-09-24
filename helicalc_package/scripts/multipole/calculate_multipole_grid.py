@@ -144,9 +144,13 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('-r', '--Region', default='body',
                    help='map | measurement | body (default) | axis | maxwell')
-    p.add_argument('-D', '--Device', type=int, default=0, help='GPU index')
+    p.add_argument('-D', '--Device', type=int, default=0,
+                   help='bar-split index, and the GPU unless --gpu is given')
     p.add_argument('-N', '--NDevices', type=int, default=1,
-                   help='total GPUs the bar list is split across')
+                   help='number of parts the bar list is split into')
+    p.add_argument('--gpu', type=int, default=None,
+                   help='GPU to run on (default: -D).  Lets part D of N run on '
+                        'any free GPU')
     p.add_argument('-g', '--Geom', default='Multipole_HLLHC_V1',
                    help='assembly basename in dev/params/')
     p.add_argument('-e', '--Element', default=None,
@@ -183,6 +187,7 @@ def main(argv=None):
     p.add_argument('--per-element', action='store_true')
     p.add_argument('--log', action='store_true', help='redirect stdout to a log file')
     args = p.parse_args(argv)
+    gpu = args.Device if args.gpu is None else args.gpu
 
     a = None if str(args.winding_radius).lower() in ('auto', 'none', '') \
         else float(args.winding_radius)
@@ -225,9 +230,9 @@ def main(argv=None):
             df = add_points_for_J(df, dxyz=args.dxyz_Jacobian)
             suff = '_Jacobian'
 
-        print('region=%s  points=%d  bars=%d  GPU=%d/%d'
-              % (args.Region, len(df), len(bars), args.Device, args.NDevices))
-        out = add_field(df, bars, dev=args.Device, per_element=args.per_element)
+        print('region=%s  points=%d  bars=%d  part=%d/%d  GPU=%d'
+              % (args.Region, len(df), len(bars), args.Device, args.NDevices, gpu))
+        out = add_field(df, bars, dev=gpu, per_element=args.per_element)
 
         tag = '' if args.Element is None else '_' + args.Element
         if args.name_tag:
