@@ -49,7 +49,11 @@ def solve_linear(J, data, weights=None, offset=None, rcond=None, scale_covar=Fal
         U, S, Vt = linalg.svd(A, full_matrices=False, lapack_driver='gesdd', overwrite_a=True,
                               check_finite=False)
         driver = 'gesdd'
-    except linalg.LinAlgError as e:
+    except (linalg.LinAlgError, ValueError) as e:
+        # ValueError: gesdd's work array exceeds 32-bit LAPACK indexing (~4 P^2 > 2^31, e.g. M 88k x P 24.5k); raised by the
+        # workspace query before A is touched. gesvd needs only O(M + P) workspace (slower). Any other ValueError is re-raised.
+        if isinstance(e, ValueError) and 'work array' not in str(e):
+            raise
         print(f'solve_linear: WARNING gesdd failed ({e}); falling back to gesvd.', flush=True)
         if A_bak is not None:
             A = A_bak
