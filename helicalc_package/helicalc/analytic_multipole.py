@@ -239,6 +239,55 @@ class SheetMultipole(object):
         return tuple(out)
 
 
+class SquareLoop(object):
+    '''Thin-filament square current loop with moment m [A m^2] along moment_dir (exact Biot-Savart).
+
+    The same corners, circulation and current (I = m / side^2) as helicalc.multipole.make_square_loop,
+    whose bars have a 2 x 3.75 mm cross-section; at the >= 40 mm from the loop where the field is used,
+    the filament differs by ~(size/d)^2/24 ~ 1e-4 relative.  Straight segment A -> B at P (a = A - P,
+    b = B - P): B = mu0 I / (4 pi) (|a| + |b|) (a x b) / (|a| |b| (|a| |b| + a . b)).
+    '''
+
+    def __init__(self, center, moment_dir, moment, side=0.04, name='PERT'):
+        c = np.asarray(center, float)
+        nhat = np.asarray(moment_dir, float)
+        nhat = nhat / np.linalg.norm(nhat)
+        tmp = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(tmp, nhat)) > 0.9:
+            tmp = np.array([0.0, 0.0, 1.0])
+        u = np.cross(nhat, tmp)
+        u /= np.linalg.norm(u)
+        v = np.cross(nhat, u)
+        h = 0.5 * side
+        self.corners = np.array([c - h * u - h * v, c + h * u - h * v, c + h * u + h * v, c - h * u + h * v])
+        self.I = moment / side ** 2
+        self.name = name
+        self.n, self.skew = 0, False
+
+    def moment(self):
+        '''m = I/2 sum r x dl over the closed polygon (check)'''
+        P = self.corners
+        return 0.5 * self.I * sum(np.cross(P[i], P[(i + 1) % 4] - P[i]) for i in range(4))
+
+    def B_xyz(self, x, y, z):
+        P = np.stack([np.asarray(x, float), np.asarray(y, float), np.asarray(z, float)], axis=-1)
+        B = np.zeros_like(P)
+        for i in range(4):
+            a = self.corners[i] - P
+            b = self.corners[(i + 1) % 4] - P
+            na, nb = np.linalg.norm(a, axis=-1), np.linalg.norm(b, axis=-1)
+            f = (na + nb) / (na * nb * (na * nb + np.sum(a * b, axis=-1)))
+            B += f[..., None] * np.cross(a, b)
+        B *= MU0 * self.I / (4 * np.pi)
+        return B[..., 0], B[..., 1], B[..., 2]
+
+
+def pert_loop(**kw):
+    '''The handoff PERT (helicalc.multipole.PERT_SPEC): 40 mm loop, m = 15 A m^2 along y at (0.12, 0, 2.15)'''
+    from helicalc.multipole import PERT_SPEC as s
+    return SquareLoop(s['center'], s['moment_dir'], s['moment'], s['side'], name=s['name'], **kw)
+
+
 # ---------------------------------------------------------------------------
 # field evaluation on points
 # ---------------------------------------------------------------------------
@@ -268,7 +317,9 @@ def add_field(df, elements, r_round=9, per_element=False, **qkw):
     tot = [np.zeros(len(df)) for _ in range(3)]
     for el in elements:
         part = [np.zeros(len(df)) for _ in range(3)]
-        for rv in np.unique(r):
+        if hasattr(el, 'B_xyz'):          # conductor elements (SquareLoop): direct Biot-Savart
+            part = list(el.B_xyz(X, Y, Z))
+        for rv in (np.unique(r) if not hasattr(el, 'B_xyz') else []):
             sel = np.where(r == rv)[0]
             zu, inv = np.unique(Z[sel], return_inverse=True)
             Qs = el.Q(float(rv), zu, **qkw)
