@@ -3,6 +3,12 @@ Analytic nested-dipole (MCBH + MCBV) truth maps on the Part A0 grids, with valid
 
     python build_analytic_dipole.py --model B
     python build_analytic_dipole.py --model A --enge-deg 3
+    python build_analytic_dipole.py --model B --rand-units 1 --rand-orders 2-6 --seed 48750
+
+--rand-units S adds "random" harmonics (model B only): for each n in --rand-orders a normal and a skew
+ideal sheet on the MCBH winding over the same z range, strengths drawn N(0, S) units, 1 unit = 1e-4 of
+B_ref (2.05 T) at R_ref.  The tag becomes analytic_B_rand<S>u_n<orders>_s<seed>; the drawn values go in
+the log and the JSON sidecar.
 
 Positions are copied from the helicalc A0 files, so the analytic and helicalc maps share every
 point.  Output (tesla, same columns as helicalc) under /home/ckampa/data/Bmaps/multipole/analytic/:
@@ -74,12 +80,32 @@ def fit_enge(z, b, B_ref, z0, z1, D, deg, frac=0.01):
     return f.x, np.sqrt(np.mean(res ** 2)), np.abs(res).max(), dmin
 
 
-def build_elements(model, deg, mmax):
+def random_harmonics(orders, units, seed, host):
+    '''normal + skew ideal sheets of each order n on the host coil's radius and z range'''
+    rng = np.random.default_rng(seed)
+    unit = 1e-4 * host.B_ref
+    els, vals = [], {}
+    for n in orders:
+        for skew in (False, True):
+            u = float(rng.normal(0.0, units))
+            lab = '%s%d' % ('a' if skew else 'b', n)
+            vals[lab] = u
+            els.append(am.SheetMultipole(n, skew, u * unit, host.z0, host.z1, host.a, R_ref=host.R_ref,
+                                         name='rand_' + lab))
+    return els, vals
+
+
+def build_elements(model, deg, mmax, rand=None):
     info = {}
     if model == 'B':
         els = am.nested_dipoles('B')
         for e in els:
             info[e.name] = dict(a=e.a, z0=e.z0, z1=e.z1, calib_scale=e.scale, dk=e.dk, kcut=e.kcut)
+        if rand is not None:
+            extra, vals = random_harmonics(rand['orders'], rand['units'], rand['seed'], els[0])
+            els += extra
+            info['random_harmonics'] = dict(units_sigma=rand['units'], seed=rand['seed'], host='MCBH',
+                                            unit_T_at_Rref=1e-4 * els[0].B_ref, values_units=vals)
         return els, info
     engs = {}
     for name, comp in (('MCBH', 'By'), ('MCBV', 'Bx')):
@@ -146,12 +172,27 @@ def main(argv=None):
     ap.add_argument('--outdir', default=HDIR + 'analytic/')
     ap.add_argument('--no-maps', action='store_true', help='validate only')
     ap.add_argument('--skip-divcurl', action='store_true', help='skip the (slow) div/curl check')
+    ap.add_argument('--rand-units', type=float, default=0.0,
+                    help='model B: sigma of random harmonics in units (1e-4 of B_ref at R_ref); 0 = none')
+    ap.add_argument('--rand-orders', default='2-6', help='orders for --rand-units, e.g. 2-6 or 2,3,4')
+    ap.add_argument('--seed', type=int, default=48750)
     args = ap.parse_args(argv)
     qkw = {'mmax': args.mmax} if args.model == 'A' else {}
     tag = 'analytic_%s' % args.model
+    rand = None
+    if args.rand_units > 0:
+        if args.model != 'B':
+            raise SystemExit('--rand-units needs --model B')
+        if '-' in args.rand_orders:
+            lo, hi = (int(v) for v in args.rand_orders.split('-'))
+            orders = list(range(lo, hi + 1))
+        else:
+            orders = [int(v) for v in args.rand_orders.split(',')]
+        rand = dict(units=args.rand_units, orders=orders, seed=args.seed)
+        tag += '_rand%gu_n%s_s%d' % (args.rand_units, args.rand_orders.replace(',', '.'), args.seed)
     t0 = time.time()
-    log('model %s: building elements' % args.model)
-    els, info = build_elements(args.model, args.enge_deg, args.mmax)
+    log('model %s (%s): building elements' % (args.model, tag))
+    els, info = build_elements(args.model, args.enge_deg, args.mmax, rand)
     log('elements: %s' % json.dumps(info, indent=1))
 
     # ---- validation 1: div / curl
@@ -174,6 +215,15 @@ def main(argv=None):
         log('(2) %s body z = 3.5, r = R_ref: %s_%d = %.6f T (design %.2f); other |c_n| max %.1e T'
             % (e.name, 'A' if e.skew else 'B', e.n, bn, e.B_ref, other))
 
+    if rand is not None:
+        Bx, By, Bz = am.field_xyz(els, 0.05 * np.cos(ph), 0.05 * np.sin(ph), np.full(64, 3.5), **qkw)
+        c = np.fft.rfft(Bx * np.cos(ph) + By * np.sin(ph)) * 2 / 64
+        unit = 1e-4 * 2.05
+        for n in [1] + rand['orders']:
+            log('(2r) total field, z = 3.5, R_ref: n = %d  b = %+.4f  a = %+.4f units (drawn b %s, a %s)' % (
+                n, -c.imag[n] / unit, c.real[n] / unit,
+                '%+.4f' % info['random_harmonics']['values_units'].get('b%d' % n, float('nan')),
+                '%+.4f' % info['random_harmonics']['values_units'].get('a%d' % n, float('nan'))))
     if args.model == 'A':
         # ---- validation 4: series convergence at r = 60 mm
         zz = np.linspace(1.9, 5.1, 641)
@@ -212,9 +262,11 @@ def main(argv=None):
     if 'measurement_region_MCB_Z1p9to5p1_k3_phi64' in outs:
         m = pd.read_pickle(outs['measurement_region_MCB_Z1p9to5p1_k3_phi64'])
         zs, C = harmonics(m)
-        other = np.abs(np.delete(C, 1, axis=1)).max()
-        log('(3) harmonic content, r = 60 mm, all %d Z: |c_1| max %.4f T; all other n (0, 2..32) max %.1e T'
-            % (len(zs), np.abs(C[:, 1]).max(), other))
+        present = [1] + (rand['orders'] if rand else [])
+        other = np.abs(np.delete(C, present, axis=1)).max()
+        log('(3) harmonic content, r = 60 mm, all %d Z: |c_1| max %.4f T; n in %s max |c_n| %s G; all other n max %.1e T'
+            % (len(zs), np.abs(C[:, 1]).max(), present[1:],
+               [round(1e4 * np.abs(C[:, n]).max(), 3) for n in present[1:]], other))
     json.dump(dict(model=args.model, info=info, outputs=outs, when=datetime.now().isoformat()),
               open(os.path.join(args.outdir, 'Multipole_HLLHC_V1_%s.MCB_Z1p9to5p1.json' % tag), 'w'), indent=1)
     log('done, %.0f s' % (time.time() - t0))
