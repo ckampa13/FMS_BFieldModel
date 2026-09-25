@@ -282,6 +282,28 @@ class SquareLoop(object):
         return B[..., 0], B[..., 1], B[..., 2]
 
 
+class Displaced(object):
+    '''An element rigidly displaced by (dx, dy) in the transverse plane: B(x, y, z) = B_el(x - dx, y - dy, z).
+
+    Exact (a translation of an exact Laplace solution), so the feed-down to lower orders about the nominal
+    axis comes out automatically, including the ends.  Evaluated through add_field on the shifted
+    coordinates, i.e. once per unique radius about the displaced axis.
+    '''
+
+    def __init__(self, el, dx, dy, name=None):
+        self.el, self.dx, self.dy = el, float(dx), float(dy)
+        self.name = name or (el.name + '_disp')
+        self.n, self.skew = el.n, el.skew
+
+    def B_xyz(self, x, y, z, **qkw):
+        import pandas as pd
+        df = pd.DataFrame({'X': np.atleast_1d(np.asarray(x, float)) - self.dx,
+                           'Y': np.atleast_1d(np.asarray(y, float)) - self.dy,
+                           'Z': np.atleast_1d(np.asarray(z, float))})
+        o = add_field(df, [self.el], **qkw)
+        return o.Bx.values, o.By.values, o.Bz.values
+
+
 def pert_loop(**kw):
     '''The handoff PERT (helicalc.multipole.PERT_SPEC): 40 mm loop, m = 15 A m^2 along y at (0.12, 0, 2.15)'''
     from helicalc.multipole import PERT_SPEC as s
@@ -317,7 +339,9 @@ def add_field(df, elements, r_round=9, per_element=False, **qkw):
     tot = [np.zeros(len(df)) for _ in range(3)]
     for el in elements:
         part = [np.zeros(len(df)) for _ in range(3)]
-        if hasattr(el, 'B_xyz'):          # conductor elements (SquareLoop): direct Biot-Savart
+        if isinstance(el, Displaced):     # displaced element: its own add_field on shifted coordinates
+            part = list(el.B_xyz(X, Y, Z, r_round=r_round, **qkw))
+        elif hasattr(el, 'B_xyz'):        # conductor elements (SquareLoop): direct Biot-Savart
             part = list(el.B_xyz(X, Y, Z))
         for rv in (np.unique(r) if not hasattr(el, 'B_xyz') else []):
             sel = np.where(r == rv)[0]

@@ -1,0 +1,250 @@
+'''Analytic corrector package (plan 3, docdb models 19_*): the nine corrector elements of helicalc's ASSEMBLY_ELEMENTS
+(MQS ... MCSS; no MQ/MCB/PERT) as model B ideal cos(n theta) sheets on the helicalc grid of the corrector-only map
+(Z 4.4-8.6, dense Z 6.67 mm x 64 phi; FMS task 2), plus optional per-magnet random harmonics and rigid transverse offsets.
+
+Pieces (each written once to <outdir>/parts_CORR/, then summed by --combine):
+    design          the nine sheets on the nominal axis
+    rh              random harmonics per magnet: normal + skew sheets n = 1..20 (not the magnet's own main term) on the
+                    magnet's radius and z range, sigma_n = 1 unit (n <= 6), 0.6^(n-6) units above; 1 unit = 1e-4 of the
+                    magnet's main field at R_ref; seed --rh-seed. On the nominal axis (their own feed-down ~ d/R x 1 unit).
+    disp            the nine design sheets displaced by --offset-mm in a random direction per magnet (seed --dir-seed;
+                    the same directions for every offset). Exact: B(x - dx, y - dy, z) of the centred sheet.
+    python build_analytic_correctors.py --part design|rh|disp [--offset-mm 0.1] [--workers 12]
+    python build_analytic_correctors.py --combine [--rh] [--offset-mm 0.1]      -> the map + validation
+Run in the helicalc env; the module is loaded by path from this worktree (not pip-installed).
+'''
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from multiprocessing import Pool
+
+import numpy as np
+import pandas as pd
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+MOD = os.path.join(HERE, '..', '..', 'helicalc', 'analytic_multipole.py')
+_spec = importlib.util.spec_from_file_location('analytic_multipole', MOD)
+am = importlib.util.module_from_spec(_spec)
+sys.modules['analytic_multipole'] = am      # so the element classes pickle for the worker pool
+_spec.loader.exec_module(am)
+from helicalc.multipole import ASSEMBLY_ELEMENTS, MultipoleGeom
+
+HDIR = '/home/ckampa/data/Bmaps/multipole/'
+GEOM = 'Multipole_HLLHC_V1_saddle'
+REG = {'meas': 'measurement_region_CORR_Z4p4to8p6_k3_phi64', 'test': 'map_region_CORR_Z4p4to8p6'}
+SRC = {'meas': HDIR + GEOM + '.' + REG['meas'] + '.summed.pkl', 'test': HDIR + GEOM + '.' + REG['test'] + '.summed.pkl'}
+HPART = HDIR + GEOM + '.measurement_region_%s_Z4p4to8p6_k3_phi64.GPU0_of_1.pkl'
+UNION = [0, 2, 3, 4, 5, 6, 9, 10, 12, 14, 15, 18]      # allowed orders N(2k+1) of the correctors present (+ 0)
+N_MAX_RH = 20
+
+
+def log(msg):
+    print('[%s] %s' % (datetime.now().strftime('%F %T'), msg))
+    sys.stdout.flush()
+
+
+def sigma_units(n):
+    return 1.0 if n <= 6 else 0.6 ** (n - 6)
+
+
+def design_elements():
+    g = MultipoleGeom(aperture=0.150, a=0.090)
+    els = []
+    for s in ASSEMBLY_ELEMENTS:
+        if s['kind'] != 'corr':
+            continue
+        els.append(am.SheetMultipole(s['n'], s['skew'], s['B_ref'], s['z0'], s['z1'], g.a, R_ref=g.R_ref, name=s['name']))
+    return els
+
+
+def rh_elements(design, seed):
+    '''list (per magnet) of lists of random-harmonic sheets, and the drawn values [units]'''
+    rng = np.random.default_rng(seed)
+    groups, vals = [], {}
+    for e in design:
+        unit = 1e-4 * e.B_ref
+        grp = []
+        for n in range(1, N_MAX_RH + 1):
+            for skew in (False, True):
+                if n == e.n and skew == e.skew:
+                    continue
+                u = float(rng.normal(0.0, sigma_units(n)))
+                lab = '%s_%s%d' % (e.name, 'a' if skew else 'b', n)
+                vals[lab] = u
+                grp.append(am.SheetMultipole(n, skew, u * unit, e.z0, e.z1, e.a, R_ref=e.R_ref, name='rh_' + lab,
+                                             calibrate=False))
+        groups.append(grp)
+    return groups, vals
+
+
+def directions(design, seed):
+    rng = np.random.default_rng(seed)
+    return {e.name: float(rng.uniform(0, 2 * np.pi)) for e in design}
+
+
+def _eval(args):
+    pos, els = args
+    o = am.add_field(pos, els)
+    return o[['Bx', 'By', 'Bz']].values
+
+
+def offset_tag(d_mm):
+    return ('%g' % d_mm).replace('.', 'p') + 'mm'
+
+
+def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None):
+    if part == 'design':
+        t = 'design'
+    elif part == 'rh':
+        t = 'rh_s%d' % rh_seed
+    else:
+        t = 'disp_%s_s%d' % (offset_tag(d_mm), dir_seed)
+    return os.path.join(outdir, 'parts_CORR', 'CORR_%s.%s.pkl' % (t, REG[reg]))
+
+
+def build_part(a):
+    design = design_elements()
+    if a.part == 'design':
+        tasks_els = [[e] for e in design]
+        info = {e.name: dict(n=e.n, skew=e.skew, B_ref=e.B_ref, z0=e.z0, z1=e.z1, a=e.a, calib_scale=e.scale) for e in design}
+    elif a.part == 'rh':
+        tasks_els, vals = rh_elements(design, a.rh_seed)
+        info = dict(seed=a.rh_seed, sigma='1 unit n<=6, 0.6^(n-6) above, n 1..20', values_units=vals)
+    else:
+        dirs = directions(design, a.dir_seed)
+        d = 1e-3 * a.offset_mm
+        tasks_els = [[am.Displaced(e, d * np.cos(dirs[e.name]), d * np.sin(dirs[e.name]))] for e in design]
+        info = dict(offset_mm=a.offset_mm, dir_seed=a.dir_seed, directions_rad=dirs)
+    log('part %s: %s' % (a.part, json.dumps(info)[:2000]))
+    os.makedirs(os.path.join(a.outdir, 'parts_CORR'), exist_ok=True)
+    for reg in ('meas', 'test'):
+        path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed)
+        if os.path.exists(path):
+            log('EXISTS, not overwritten: %s' % path)
+            continue
+        h = pd.read_pickle(SRC[reg])
+        pos = h[['X', 'Y', 'Z']].copy()
+        t1 = time.time()
+        with Pool(a.workers) as pool:
+            res = pool.map(_eval, [(pos, els) for els in tasks_els])
+        B = np.sum(res, axis=0)
+        if not np.isfinite(B).all():
+            raise SystemExit('non-finite field values; %s NOT written' % path)
+        out = h.drop(columns=['Bx', 'By', 'Bz']).copy()
+        out['Bx'], out['By'], out['Bz'] = B[:, 0], B[:, 1], B[:, 2]
+        out = out[list(h.columns)]
+        out.to_pickle(path)
+        log('wrote %s (%d rows, %.0f s)' % (path, len(out), time.time() - t1))
+    json.dump(dict(part=a.part, info=info, when=datetime.now().isoformat()),
+              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed).replace('.pkl', '.json'), 'w'), indent=1)
+
+
+def harmonics_r60(df):
+    '''|c_n| of B_r over the 64 phi at each Z (n = 0..32), r = 60 mm'''
+    d = df[df.HP == 'r060mm'].copy()
+    d['Br'] = d.Bx * np.cos(d.phi) + d.By * np.sin(d.phi)
+    d['k'] = np.rint(np.mod(d.phi, 2 * np.pi) * 64 / (2 * np.pi)).astype(int) % 64
+    d = d.sort_values(['Z', 'k'])
+    zs = np.unique(d.Z)
+    br = d.Br.values.reshape(len(zs), 64)
+    return zs, np.fft.rfft(br, axis=1) * 2 / 64
+
+
+def combine(a):
+    tag = 'analytic_B_CORR'
+    if a.rh:
+        tag += '_RHs%d' % a.rh_seed
+    if a.offset_mm:
+        tag += '_d%s_s%d' % (offset_tag(a.offset_mm), a.dir_seed)
+    outs = {}
+    for reg in ('meas', 'test'):
+        path = os.path.join(a.outdir, 'Multipole_HLLHC_V1_%s.%s.pkl' % (tag, REG[reg]))
+        base = part_path(a.outdir, 'disp' if a.offset_mm else 'design', reg, a.offset_mm, a.rh_seed, a.dir_seed)
+        parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed)] if a.rh else [])
+        ds = [pd.read_pickle(p) for p in parts]
+        for d in ds[1:]:
+            assert d[['X', 'Y', 'Z']].equals(ds[0][['X', 'Y', 'Z']])
+        out = ds[0].copy()
+        for c in ('Bx', 'By', 'Bz'):
+            out[c] = sum(d[c].values for d in ds)
+        h = pd.read_pickle(SRC[reg])
+        assert out[['X', 'Y', 'Z']].equals(h[['X', 'Y', 'Z']])
+        if os.path.exists(path):
+            log('EXISTS, not overwritten: %s' % path)
+        else:
+            out.to_pickle(path)
+            log('wrote %s (%d rows) = %s' % (path, len(out), ' + '.join(os.path.basename(p) for p in parts)))
+        outs[reg] = (path, out)
+    # validation: harmonic content at r = 60 mm by order class, and max |B_i|
+    m = outs['meas'][1]
+    zs, C = harmonics_r60(m)
+    A = np.abs(C) * 1e4
+    out_union = [n for n in range(1, 32) if n not in UNION]
+    log('max |B_i| meas %.5f T; test %.5f T' % (m[['Bx', 'By', 'Bz']].abs().max().max(),
+                                                   outs['test'][1][['Bx', 'By', 'Bz']].abs().max().max()))
+    log('harmonics at r = 60 mm, max over Z [G]: ' + ', '.join('n%d %.3g' % (n, A[:, n].max()) for n in range(1, 21)))
+    log('  in-union (1..31) RMS over Z of the per-Z quadrature sum: %.3f G; out-of-union: %.3f G (orders %s)' % (
+        np.sqrt(np.mean(np.sum(A[:, [n for n in UNION if n > 0]] ** 2, axis=1))),
+        np.sqrt(np.mean(np.sum(A[:, out_union] ** 2, axis=1))), out_union[:10]))
+    # per-element body strength at the element centre (main term) and the n = 1 at the MQS centre, r = 60 mm scaled to R_ref
+    for e in design_elements():
+        zc = 0.5 * (e.z0 + e.z1)
+        i = np.argmin(np.abs(zs - zc))
+        c = C[i]
+        main = (-c.imag[e.n] if not e.skew else c.real[e.n]) * (0.05 / 0.06) ** (e.n - 1)
+        log('  %-5s z %.3f: main %s%d at R_ref %.4f T (design %.2f); |c_1| at r 60 %.3f G' % (
+            e.name, zs[i], 'A' if e.skew else 'B', e.n, main, e.B_ref, 1e4 * np.abs(c[1])))
+    json.dump(dict(tag=tag, outputs={k: v[0] for k, v in outs.items()}, when=datetime.now().isoformat()),
+              open(os.path.join(a.outdir, 'Multipole_HLLHC_V1_%s.CORR_Z4p4to8p6.json' % tag), 'w'), indent=1)
+
+
+def compare_helicalc(a):
+    '''design part vs the helicalc corrector-only partials, per element, meas grid [G]'''
+    dsg = design_elements()
+    h = pd.read_pickle(SRC['meas'])
+    pos = h[['X', 'Y', 'Z']].copy()
+    for e in dsg:
+        hp = pd.read_pickle(HPART % e.name)
+        assert hp[['X', 'Y', 'Z']].equals(h[['X', 'Y', 'Z']])
+        B = _eval((pos, [e]))
+        d = 1e4 * np.sqrt(((B - hp[['Bx', 'By', 'Bz']].values) ** 2).sum(axis=1))
+        z = h.Z.values
+        body = (z > e.z0 + 0.3 * (e.z1 - e.z0)) & (z < e.z1 - 0.3 * (e.z1 - e.z0))
+        ends = (np.abs(z - e.z0) < 0.05) | (np.abs(z - e.z1) < 0.05)
+        far = (z < e.z0 - 0.3) | (z > e.z1 + 0.3)
+        hB = 1e4 * np.sqrt((hp[['Bx', 'By', 'Bz']].values ** 2).sum(axis=1))
+        log('  %-5s |dB| rms/max [G]: body %.2f/%.2f (|B| max %.0f), ends +-5 cm %.1f/%.1f, far (> 0.3 m) %.3f/%.3f' % (
+            e.name, np.sqrt(np.mean(d[body] ** 2)), d[body].max(), hB[body].max(),
+            np.sqrt(np.mean(d[ends] ** 2)), d[ends].max(), np.sqrt(np.mean(d[far] ** 2)), d[far].max()))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--part', choices=['design', 'rh', 'disp'])
+    ap.add_argument('--combine', action='store_true')
+    ap.add_argument('--compare-helicalc', action='store_true')
+    ap.add_argument('--rh', action='store_true', help='--combine: include the random harmonics')
+    ap.add_argument('--offset-mm', type=float, default=0.0)
+    ap.add_argument('--rh-seed', type=int, default=48751)
+    ap.add_argument('--dir-seed', type=int, default=48752)
+    ap.add_argument('--workers', type=int, default=9)
+    ap.add_argument('--outdir', default=HDIR + 'analytic/')
+    a = ap.parse_args()
+    t0 = time.time()
+    if a.part:
+        if a.part == 'disp' and not a.offset_mm:
+            raise SystemExit('--part disp needs --offset-mm')
+        build_part(a)
+    if a.compare_helicalc:
+        compare_helicalc(a)
+    if a.combine:
+        combine(a)
+    log('done, %.0f s' % (time.time() - t0))
+
+
+if __name__ == '__main__':
+    main()
