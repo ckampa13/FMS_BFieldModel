@@ -9,8 +9,14 @@ Pieces (each written once to <outdir>/parts_CORR/, then summed by --combine):
                     magnet's main field at R_ref; seed --rh-seed. On the nominal axis (their own feed-down ~ d/R x 1 unit).
     disp            the nine design sheets displaced by --offset-mm in a random direction per magnet (seed --dir-seed;
                     the same directions for every offset). Exact: B(x - dx, y - dy, z) of the centred sheet.
+    leads           one closed go/return current-lead loop per corrector (exact filament Biot-Savart): from the coil terminal at
+                    r = 90 mm at the magnet's downstream end, radially to r = 200 mm, axially to z = 10 m and back, the two
+                    conductors dphi = 10 mm / 90 mm apart; azimuth and current sign random per magnet (seed --lead-seed);
+                    --lead-current [A]. Free space (the superferric yoke would shield the axial runs): an upper bound.
+    dipole          the upstream nested dipoles MCBH + MCBV (model B, analytic_multipole.nested_dipoles, z 2.4-4.6) on the
+                    same grid: the map's upstream end (4.4) then sits in the dipole body (~2 T), as a partial-string map would.
     python build_analytic_correctors.py --part design|rh|disp [--offset-mm 0.1] [--workers 12]
-    python build_analytic_correctors.py --combine [--rh] [--offset-mm 0.1]      -> the map + validation
+    python build_analytic_correctors.py --combine [--rh] [--offset-mm 0.1] [--dipole]      -> the map + validation
 Run in the helicalc env; the module is loaded by path from this worktree (not pip-installed).
 '''
 import argparse
@@ -81,6 +87,20 @@ def rh_elements(design, seed):
     return groups, vals
 
 
+def lead_elements(design, I, seed, r_t=0.090, r_b=0.200, sep=0.010, z_far=10.0):
+    rng = np.random.default_rng(seed)
+    cyl = lambda r, p, z: (r * np.cos(p), r * np.sin(p), z)
+    els, info = [], {}
+    dp = sep / r_t
+    for e in design:
+        phi = float(rng.uniform(0, 2 * np.pi)); sgn = float(rng.choice([-1.0, 1.0])); z1 = e.z1
+        C = [cyl(r_t, phi - dp / 2, z1), cyl(r_b, phi - dp / 2, z1), cyl(r_b, phi - dp / 2, z_far),
+             cyl(r_b, phi + dp / 2, z_far), cyl(r_b, phi + dp / 2, z1), cyl(r_t, phi + dp / 2, z1)]
+        els.append(am.Polyline(C, sgn * I, name='lead_' + e.name))
+        info[e.name] = dict(phi_rad=phi, sign=sgn, z_exit=z1, I_A=sgn * I)
+    return els, dict(r_terminal=r_t, r_busbar=r_b, sep_m=sep, z_far=z_far, seed=seed, leads=info)
+
+
 def directions(design, seed):
     rng = np.random.default_rng(seed)
     return {e.name: float(rng.uniform(0, 2 * np.pi)) for e in design}
@@ -96,9 +116,13 @@ def offset_tag(d_mm):
     return ('%g' % d_mm).replace('.', 'p') + 'mm'
 
 
-def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None):
+def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None, lead_current=None, lead_seed=None):
     if part == 'design':
         t = 'design'
+    elif part == 'dipole':
+        t = 'dipole_MCB'
+    elif part == 'leads':
+        t = 'leads_%dA_s%d' % (round(lead_current), lead_seed)
     elif part == 'rh':
         t = 'rh_s%d' % rh_seed
     else:
@@ -111,6 +135,13 @@ def build_part(a):
     if a.part == 'design':
         tasks_els = [[e] for e in design]
         info = {e.name: dict(n=e.n, skew=e.skew, B_ref=e.B_ref, z0=e.z0, z1=e.z1, a=e.a, calib_scale=e.scale) for e in design}
+    elif a.part == 'leads':
+        tasks_els, info = lead_elements(design, a.lead_current, a.lead_seed)
+        tasks_els = [[e] for e in tasks_els]
+    elif a.part == 'dipole':
+        dip = am.nested_dipoles('B')
+        tasks_els = [[e] for e in dip]
+        info = {e.name: dict(n=e.n, skew=e.skew, B_ref=e.B_ref, z0=e.z0, z1=e.z1, a=e.a, calib_scale=e.scale) for e in dip}
     elif a.part == 'rh':
         tasks_els, vals = rh_elements(design, a.rh_seed)
         info = dict(seed=a.rh_seed, sigma='1 unit n<=6, 0.6^(n-6) above, n 1..20', values_units=vals)
@@ -122,7 +153,7 @@ def build_part(a):
     log('part %s: %s' % (a.part, json.dumps(info)[:2000]))
     os.makedirs(os.path.join(a.outdir, 'parts_CORR'), exist_ok=True)
     for reg in ('meas', 'test'):
-        path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed)
+        path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed)
         if os.path.exists(path):
             log('EXISTS, not overwritten: %s' % path)
             continue
@@ -140,7 +171,7 @@ def build_part(a):
         out.to_pickle(path)
         log('wrote %s (%d rows, %.0f s)' % (path, len(out), time.time() - t1))
     json.dump(dict(part=a.part, info=info, when=datetime.now().isoformat()),
-              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed).replace('.pkl', '.json'), 'w'), indent=1)
+              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed).replace('.pkl', '.json'), 'w'), indent=1)
 
 
 def harmonics_r60(df):
@@ -160,11 +191,17 @@ def combine(a):
         tag += '_RHs%d' % a.rh_seed
     if a.offset_mm:
         tag += '_d%s_s%d' % (offset_tag(a.offset_mm), a.dir_seed)
+    if a.dipole:
+        tag += '_MCB'
+    if a.leads:
+        tag += '_L%dA_s%d' % (round(a.lead_current), a.lead_seed)
     outs = {}
     for reg in ('meas', 'test'):
         path = os.path.join(a.outdir, 'Multipole_HLLHC_V1_%s.%s.pkl' % (tag, REG[reg]))
         base = part_path(a.outdir, 'disp' if a.offset_mm else 'design', reg, a.offset_mm, a.rh_seed, a.dir_seed)
-        parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed)] if a.rh else [])
+        parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed)] if a.rh else []) + \
+            ([part_path(a.outdir, 'dipole', reg)] if a.dipole else []) + \
+            ([part_path(a.outdir, 'leads', reg, lead_current=a.lead_current, lead_seed=a.lead_seed)] if a.leads else [])
         ds = [pd.read_pickle(p) for p in parts]
         for d in ds[1:]:
             assert d[['X', 'Y', 'Z']].equals(ds[0][['X', 'Y', 'Z']])
@@ -224,10 +261,14 @@ def compare_helicalc(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--part', choices=['design', 'rh', 'disp'])
+    ap.add_argument('--part', choices=['design', 'rh', 'disp', 'dipole', 'leads'])
     ap.add_argument('--combine', action='store_true')
     ap.add_argument('--compare-helicalc', action='store_true')
     ap.add_argument('--rh', action='store_true', help='--combine: include the random harmonics')
+    ap.add_argument('--dipole', action='store_true', help='--combine: include the upstream nested dipoles')
+    ap.add_argument('--leads', action='store_true', help='--combine: include the current leads')
+    ap.add_argument('--lead-current', type=float, default=200.0)
+    ap.add_argument('--lead-seed', type=int, default=48753)
     ap.add_argument('--offset-mm', type=float, default=0.0)
     ap.add_argument('--rh-seed', type=int, default=48751)
     ap.add_argument('--dir-seed', type=int, default=48752)

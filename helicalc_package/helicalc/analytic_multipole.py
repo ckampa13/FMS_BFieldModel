@@ -272,9 +272,10 @@ class SquareLoop(object):
     def B_xyz(self, x, y, z):
         P = np.stack([np.asarray(x, float), np.asarray(y, float), np.asarray(z, float)], axis=-1)
         B = np.zeros_like(P)
-        for i in range(4):
+        nc = len(self.corners)
+        for i in range(nc):
             a = self.corners[i] - P
-            b = self.corners[(i + 1) % 4] - P
+            b = self.corners[(i + 1) % nc] - P
             na, nb = np.linalg.norm(a, axis=-1), np.linalg.norm(b, axis=-1)
             f = (na + nb) / (na * nb * (na * nb + np.sum(a * b, axis=-1)))
             B += f[..., None] * np.cross(a, b)
@@ -302,6 +303,23 @@ class Displaced(object):
                            'Z': np.atleast_1d(np.asarray(z, float))})
         o = add_field(df, [self.el], **qkw)
         return o.Bx.values, o.By.values, o.Bz.values
+
+
+class Polyline(object):
+    '''Closed thin-filament polygon carrying current I [A] through corners[0] -> corners[1] -> ... -> corners[0].
+
+    Exact Biot-Savart per straight segment (as SquareLoop); a closed loop, so the field is exactly magnetostatic
+    (div B = 0, curl B = 0 off the conductor).  For current leads / busbars.
+    '''
+
+    def __init__(self, corners, I, name='lead'):
+        self.corners = np.asarray(corners, float)
+        self.I = float(I)
+        self.name = name
+        self.n, self.skew = 0, False
+
+    def B_xyz(self, x, y, z):
+        return SquareLoop.B_xyz(self, x, y, z)
 
 
 def pert_loop(**kw):
