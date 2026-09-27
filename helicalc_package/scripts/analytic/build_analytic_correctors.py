@@ -57,6 +57,24 @@ def sigma_units(n):
     return 1.0 if n <= 6 else 0.6 ** (n - 6)
 
 
+# HL-LHC TDR (CERN-2020-010) Table A-11, MQXF random column R at top energy, r0 = 50 mm, units; n = 3..14 (n > 14: 0). n = 1, 2 are not
+# in the table (b2 R there is the quadrupole's own strength error): the n = 3 values are used for them (assumption).
+MQXF_R_B = {3: 0.82, 4: 0.57, 5: 0.42, 6: 1.10, 7: 0.19, 8: 0.13, 9: 0.07, 10: 0.20, 11: 0.026, 12: 0.018, 13: 0.009, 14: 0.023}
+MQXF_R_A = {3: 0.65, 4: 0.65, 5: 0.43, 6: 0.31, 7: 0.19, 8: 0.11, 9: 0.08, 10: 0.04, 11: 0.026, 12: 0.014, 13: 0.010, 14: 0.005}
+
+
+def sigma_spectrum(n, skew, spectrum):
+    '''sigma [units] of the random b_n (skew=False) / a_n (skew=True) for the named spectrum'''
+    if spectrum == 'placeholder':
+        return sigma_units(n)
+    if spectrum == '10x':                      # the corrector design level (TDR Sec. 3.4: harmonics ~10 units) at low n, same falloff
+        return 10.0 * sigma_units(n)
+    if spectrum == 'mqxf':
+        t = MQXF_R_A if skew else MQXF_R_B
+        return t.get(max(n, 3), 0.0)
+    raise ValueError(spectrum)
+
+
 def design_elements():
     g = MultipoleGeom(aperture=0.150, a=0.090)
     els = []
@@ -67,7 +85,7 @@ def design_elements():
     return els
 
 
-def rh_elements(design, seed):
+def rh_elements(design, seed, spectrum='placeholder'):
     '''list (per magnet) of lists of random-harmonic sheets, and the drawn values [units]'''
     rng = np.random.default_rng(seed)
     groups, vals = [], {}
@@ -78,7 +96,7 @@ def rh_elements(design, seed):
             for skew in (False, True):
                 if n == e.n and skew == e.skew:
                     continue
-                u = float(rng.normal(0.0, sigma_units(n)))
+                u = float(rng.normal(0.0, 1.0)) * sigma_spectrum(n, skew, spectrum)   # same draws for every spectrum
                 lab = '%s_%s%d' % (e.name, 'a' if skew else 'b', n)
                 vals[lab] = u
                 grp.append(am.SheetMultipole(n, skew, u * unit, e.z0, e.z1, e.a, R_ref=e.R_ref, name='rh_' + lab,
@@ -116,7 +134,7 @@ def offset_tag(d_mm):
     return ('%g' % d_mm).replace('.', 'p') + 'mm'
 
 
-def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None, lead_current=None, lead_seed=None):
+def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None, lead_current=None, lead_seed=None, rh_spectrum='placeholder'):
     if part == 'design':
         t = 'design'
     elif part == 'dipole':
@@ -124,7 +142,7 @@ def part_path(outdir, part, reg, d_mm=None, rh_seed=None, dir_seed=None, lead_cu
     elif part == 'leads':
         t = 'leads_%dA_s%d' % (round(lead_current), lead_seed)
     elif part == 'rh':
-        t = 'rh_s%d' % rh_seed
+        t = 'rh_s%d' % rh_seed if rh_spectrum == 'placeholder' else 'rh_%s_s%d' % (rh_spectrum, rh_seed)
     else:
         t = 'disp_%s_s%d' % (offset_tag(d_mm), dir_seed)
     return os.path.join(outdir, 'parts_CORR', 'CORR_%s.%s.pkl' % (t, REG[reg]))
@@ -143,8 +161,8 @@ def build_part(a):
         tasks_els = [[e] for e in dip]
         info = {e.name: dict(n=e.n, skew=e.skew, B_ref=e.B_ref, z0=e.z0, z1=e.z1, a=e.a, calib_scale=e.scale) for e in dip}
     elif a.part == 'rh':
-        tasks_els, vals = rh_elements(design, a.rh_seed)
-        info = dict(seed=a.rh_seed, sigma='1 unit n<=6, 0.6^(n-6) above, n 1..20', values_units=vals)
+        tasks_els, vals = rh_elements(design, a.rh_seed, a.rh_spectrum)
+        info = dict(seed=a.rh_seed, spectrum=a.rh_spectrum, sigma='placeholder: 1 unit n<=6, 0.6^(n-6) above, n 1..20; 10x: x10; mqxf: TDR Table A-11 R', values_units=vals)
     else:
         dirs = directions(design, a.dir_seed)
         d = 1e-3 * a.offset_mm
@@ -153,7 +171,7 @@ def build_part(a):
     log('part %s: %s' % (a.part, json.dumps(info)[:2000]))
     os.makedirs(os.path.join(a.outdir, 'parts_CORR'), exist_ok=True)
     for reg in ('meas', 'test'):
-        path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed)
+        path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed, a.rh_spectrum)
         if os.path.exists(path):
             log('EXISTS, not overwritten: %s' % path)
             continue
@@ -171,7 +189,7 @@ def build_part(a):
         out.to_pickle(path)
         log('wrote %s (%d rows, %.0f s)' % (path, len(out), time.time() - t1))
     json.dump(dict(part=a.part, info=info, when=datetime.now().isoformat()),
-              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed).replace('.pkl', '.json'), 'w'), indent=1)
+              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed, a.rh_spectrum).replace('.pkl', '.json'), 'w'), indent=1)
 
 
 def harmonics_r60(df):
@@ -188,7 +206,7 @@ def harmonics_r60(df):
 def combine(a):
     tag = 'analytic_B_CORR'
     if a.rh:
-        tag += '_RHs%d' % a.rh_seed
+        tag += ('_RHs%d' % a.rh_seed) if a.rh_spectrum == 'placeholder' else ('_RH%ss%d' % (a.rh_spectrum, a.rh_seed))
     if a.offset_mm:
         tag += '_d%s_s%d' % (offset_tag(a.offset_mm), a.dir_seed)
     if a.dipole:
@@ -199,7 +217,7 @@ def combine(a):
     for reg in ('meas', 'test'):
         path = os.path.join(a.outdir, 'Multipole_HLLHC_V1_%s.%s.pkl' % (tag, REG[reg]))
         base = part_path(a.outdir, 'disp' if a.offset_mm else 'design', reg, a.offset_mm, a.rh_seed, a.dir_seed)
-        parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed)] if a.rh else []) + \
+        parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed, rh_spectrum=a.rh_spectrum)] if a.rh else []) + \
             ([part_path(a.outdir, 'dipole', reg)] if a.dipole else []) + \
             ([part_path(a.outdir, 'leads', reg, lead_current=a.lead_current, lead_seed=a.lead_seed)] if a.leads else [])
         ds = [pd.read_pickle(p) for p in parts]
@@ -271,6 +289,7 @@ def main():
     ap.add_argument('--lead-seed', type=int, default=48753)
     ap.add_argument('--offset-mm', type=float, default=0.0)
     ap.add_argument('--rh-seed', type=int, default=48751)
+    ap.add_argument('--rh-spectrum', default='placeholder', choices=['placeholder', 'mqxf', '10x'])
     ap.add_argument('--dir-seed', type=int, default=48752)
     ap.add_argument('--workers', type=int, default=9)
     ap.add_argument('--outdir', default=HDIR + 'analytic/')
