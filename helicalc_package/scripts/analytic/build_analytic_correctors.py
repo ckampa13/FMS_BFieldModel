@@ -41,8 +41,30 @@ from helicalc.multipole import ASSEMBLY_ELEMENTS, MultipoleGeom
 
 HDIR = '/home/ckampa/data/Bmaps/multipole/'
 GEOM = 'Multipole_HLLHC_V1_saddle'
-REG = {'meas': 'measurement_region_CORR_Z4p4to8p6_k3_phi64', 'test': 'map_region_CORR_Z4p4to8p6'}
+REG = {'meas': 'measurement_region_CORR_Z4p4to8p6_k3_phi64', 'test': 'map_region_CORR_Z4p4to8p6',
+       'cartoff': 'cartoff_region_CORR_Z4p4to8p6_xy5mm_zmid', 'cartz5': 'cartz5_region_CORR_Z4p4to8p6_xy5mm_z5mm'}
 SRC = {'meas': HDIR + GEOM + '.' + REG['meas'] + '.summed.pkl', 'test': HDIR + GEOM + '.' + REG['test'] + '.summed.pkl'}
+
+
+def grid(reg):
+    '''positions of a region: the helicalc grids (meas, test), or the generated Z-offset uniform test grid (cartoff; docdb 2026-09-30):
+    X, Y on a 5 mm Cartesian grid with r <= 60 mm, Z on the 630 mid-planes between the 631 measurement planes (4.4 + (j + 1/2) 4.2/630),
+    so no position is shared with the measurement grid and the volume is sampled uniformly (as the Mu2e CartVal test map).
+    cartz5: the same XY grid on Z = 4.4025 + 0.005 j (840 planes): incommensurate with the 6.667 mm measurement pitch (never on a
+    measurement plane; phases 1/8, 3/8, 5/8, 7/8 of the pitch), so the test does not sit only at the mid-planes (Cole 2026-09-30).'''
+    if reg in SRC:
+        return pd.read_pickle(SRC[reg])
+    if reg in ('cartoff', 'cartz5'):
+        xy = np.round(np.arange(-12, 13) * 0.005, 9)
+        X, Y = np.meshgrid(xy, xy, indexing='ij')
+        keep = X ** 2 + Y ** 2 <= 0.06 ** 2 + 1e-12
+        X, Y = X[keep], Y[keep]
+        Z = np.round(4.4 + (np.arange(630) + 0.5) * 4.2 / 630, 9) if reg == 'cartoff' else np.round(4.4025 + 0.005 * np.arange(840), 9)
+        g = pd.DataFrame({'X': np.tile(X, len(Z)), 'Y': np.tile(Y, len(Z)), 'Z': np.repeat(Z, len(X))})
+        for c in ('Bx', 'By', 'Bz'):
+            g[c] = 0.0
+        return g
+    raise ValueError(reg)
 HPART = HDIR + GEOM + '.measurement_region_%s_Z4p4to8p6_k3_phi64.GPU0_of_1.pkl'
 UNION = [0, 2, 3, 4, 5, 6, 9, 10, 12, 14, 15, 18]      # allowed orders N(2k+1) of the correctors present (+ 0)
 N_MAX_RH = 20
@@ -170,12 +192,12 @@ def build_part(a):
         info = dict(offset_mm=a.offset_mm, dir_seed=a.dir_seed, directions_rad=dirs)
     log('part %s: %s' % (a.part, json.dumps(info)[:2000]))
     os.makedirs(os.path.join(a.outdir, 'parts_CORR'), exist_ok=True)
-    for reg in ('meas', 'test'):
+    for reg in a.regions:
         path = part_path(a.outdir, a.part, reg, a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed, a.rh_spectrum)
         if os.path.exists(path):
             log('EXISTS, not overwritten: %s' % path)
             continue
-        h = pd.read_pickle(SRC[reg])
+        h = grid(reg)
         pos = h[['X', 'Y', 'Z']].copy()
         t1 = time.time()
         with Pool(a.workers) as pool:
@@ -188,8 +210,8 @@ def build_part(a):
         out = out[list(h.columns)]
         out.to_pickle(path)
         log('wrote %s (%d rows, %.0f s)' % (path, len(out), time.time() - t1))
-    json.dump(dict(part=a.part, info=info, when=datetime.now().isoformat()),
-              open(part_path(a.outdir, a.part, 'meas', a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed, a.rh_spectrum).replace('.pkl', '.json'), 'w'), indent=1)
+    json.dump(dict(part=a.part, info=info, regions=a.regions, when=datetime.now().isoformat()),
+              open(part_path(a.outdir, a.part, a.regions[0], a.offset_mm, a.rh_seed, a.dir_seed, a.lead_current, a.lead_seed, a.rh_spectrum).replace('.pkl', '.json'), 'w'), indent=1)
 
 
 def harmonics_r60(df):
@@ -214,7 +236,7 @@ def combine(a):
     if a.leads:
         tag += '_L%dA_s%d' % (round(a.lead_current), a.lead_seed)
     outs = {}
-    for reg in ('meas', 'test'):
+    for reg in a.regions:
         path = os.path.join(a.outdir, 'Multipole_HLLHC_V1_%s.%s.pkl' % (tag, REG[reg]))
         base = part_path(a.outdir, 'disp' if a.offset_mm else 'design', reg, a.offset_mm, a.rh_seed, a.dir_seed)
         parts = [base] + ([part_path(a.outdir, 'rh', reg, rh_seed=a.rh_seed, rh_spectrum=a.rh_spectrum)] if a.rh else []) + \
@@ -226,14 +248,18 @@ def combine(a):
         out = ds[0].copy()
         for c in ('Bx', 'By', 'Bz'):
             out[c] = sum(d[c].values for d in ds)
-        h = pd.read_pickle(SRC[reg])
-        assert out[['X', 'Y', 'Z']].equals(h[['X', 'Y', 'Z']])
+        h = grid(reg)
+        assert np.allclose(out[['X', 'Y', 'Z']].values, h[['X', 'Y', 'Z']].values, atol=1e-9)
         if os.path.exists(path):
             log('EXISTS, not overwritten: %s' % path)
         else:
             out.to_pickle(path)
             log('wrote %s (%d rows) = %s' % (path, len(out), ' + '.join(os.path.basename(p) for p in parts)))
         outs[reg] = (path, out)
+    if 'meas' not in outs:
+        for reg, (p_, o_) in outs.items():
+            log('%s: max |B_i| %.5f T, %d rows' % (reg, o_[['Bx', 'By', 'Bz']].abs().max().max(), len(o_)))
+        return
     # validation: harmonic content at r = 60 mm by order class, and max |B_i|
     m = outs['meas'][1]
     zs, C = harmonics_r60(m)
@@ -293,7 +319,10 @@ def main():
     ap.add_argument('--dir-seed', type=int, default=48752)
     ap.add_argument('--workers', type=int, default=9)
     ap.add_argument('--outdir', default=HDIR + 'analytic/')
+    ap.add_argument('--regions', default='meas,test', help="comma list of %s (cartoff: Z-offset uniform test grid)" % list(REG))
     a = ap.parse_args()
+    a.regions = a.regions.split(',')
+    assert all(r in REG for r in a.regions), a.regions
     t0 = time.time()
     if a.part:
         if a.part == 'disp' and not a.offset_mm:
