@@ -4442,26 +4442,7 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
             iv_c1[m][n] = special.iv(n, cms1[m]*r)
             ivp_c1[m][n] = special.ivp(n, cms1[m]*r)
     # first order correction for small r
-    #ns = np.arange(ns_c1)
-    #factorial_ns = np.array([factorial(n) for n in range(ns_c1)])
-    #f_r_m_n = cms1[m] * r**(n-1) / (2.**n * factorial(n-1))
     eps = 1e-7
-    # defaultdict (not JIT safe)
-    # f_r_m_n = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-    # only add the values we need (typically sparse, unless input df has a lot of field points with small r)
-    #cms_r = cms1[:, np.newaxis] * r[np.newaxis, :]
-    # ms_flat = (np.arange(ms_c1, dtype=int)[:, np.newaxis]*np.ones(cms_r.shape[1], dtype=int)[np.newaxis, :])[cms_r < eps]
-    # ks_flat = (np.arange(len(r), dtype=int)[np.newaxis, :]*np.ones(cms_r.shape[0], dtype=int)[:, np.newaxis])[cms_r < eps]
-    # # loop through only relevant elements
-    # for m, k in zip(ms_flat, ks_flat):
-    #     for n in range(2, ns_c1):
-    #         f_r_m_n[m][n][k] = n * cms1[m]**n * r[k]**(n-1) / (2.**n * factorial(n))
-
-    # cleanup
-    # del(cms_r)
-    # del(ms_flat)
-    # del(ks_flat)
-
     # dense array
     ks = np.arange(len(r))
     cms_r = cms1[:, np.newaxis] * r[np.newaxis, :]
@@ -4472,11 +4453,6 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
         for k, r_ in zip(ks[m_], r[m_]):
             for n in range(2, ns_c1):
                 f_r_m_n[m][n][k] = n * cms**n * r_**(n-1) / (2.**n * factorial(n))
-
-    print('\n\n')
-    print(f'number f_r_m_n > 0: {(f_r_m_n > 0).sum()}')
-    print(f'number f_r_m_n < 0: {(f_r_m_n < 0).sum()}')
-    print(f'f_r_m_n.size: {f_r_m_n.size}\n\n')
 
     # cleanup
     del(cms_r)
