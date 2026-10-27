@@ -38,6 +38,20 @@ def factory(version, z, r, phi, ms=MS, ns=NS, **kw):
     return f(z, r, phi, 0, 0, 0, 0, 0, 0, L, ms, ns, 0, 0, 0, Z0, **kw)
 
 
+def test_v1008_bessel_setup_fast_equals_legacy():
+    """v1008's Bessel tables per distinct radius (bessel_setup='fast', the default) are bit-identical to the per-point scipy loop ('legacy')."""
+    z, r, phi, x, y = points()
+    r = np.round(r, 3)                      # repeated radii (as on a measurement grid) + the on-axis points from points()
+    rng = np.random.default_rng(3)
+    p = base_params(rng, ks={'k1': 1., 'k2': -2., 'k3': 3., 'k4': 0.5, 'k5': 0.1, 'k6': -0.2, 'k7': 0.3})
+    b_fast = factory(1008, z, r, phi, bessel_setup='fast')(z, r, phi, x, y, **p)
+    b_legacy = factory(1008, z, r, phi, bessel_setup='legacy')(z, r, phi, x, y, **p)
+    assert np.array_equal(b_fast, b_legacy)
+    assert ff.V1008_BESSEL_SETUP in ('fast', 'legacy')
+    with pytest.raises(ValueError):
+        factory(1008, z, r, phi, bessel_setup='quick')
+
+
 def test_v1010_matches_v1008_without_k0():
     z, r, phi, x, y = points()
     rng = np.random.default_rng(1)

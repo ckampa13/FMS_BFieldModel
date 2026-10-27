@@ -4366,13 +4366,19 @@ def brzphi_3d_producer_giant_function_v1007(z, r, phi,
     return brzphi_3d_fast
 
 # remove phases, write out four full terms
+# v1008 Bessel-table setup (2026-10-26): 'fast' (default; distinct radii + _v1010_iv_ivp, bit-identical) or 'legacy' (per-point scipy loop).
+# Failsafe: set this default to 'legacy' (or export MU2E_V1008_BESSEL=legacy, or pass bessel_setup='legacy') to restore the old path.
+V1008_BESSEL_SETUP = os.environ.get('MU2E_V1008_BESSEL', 'fast')
+
+
 def brzphi_3d_producer_giant_function_v1008(z, r, phi,
                                             pitch1, ms_h1, ns_h1,
                                             pitch2, ms_h2, ns_h2,
                                             length1, ms_c1, ns_c1,
                                             length2, ms_c2, ns_c2,
                                             z0,
-                                            bz_input=None, br_input=None, bphi_input=None):
+                                            bz_input=None, br_input=None, bphi_input=None,
+                                            bessel_setup=None):
     '''
     Factory function that readies a potential fit function for a 3D magnetic field.
     This function includes:
@@ -4438,9 +4444,24 @@ def brzphi_3d_producer_giant_function_v1008(z, r, phi,
         cms1[m] = (2*(m+1)*np.pi/length1)
         sinkz_c1[m] = np.sin(cms1[m]*z_)
         coskz_c1[m] = np.cos(cms1[m]*z_)
-        for n in range(ns_c1):
-            iv_c1[m][n] = special.iv(n, cms1[m]*r)
-            ivp_c1[m][n] = special.ivp(n, cms1[m]*r)
+    setup = V1008_BESSEL_SETUP if bessel_setup is None else bessel_setup
+    if setup == 'fast':
+        # The Bessel tables depend on r only: evaluate them once per distinct radius (_v1010_iv_ivp: the same special.iv calls,
+        # I_n' from the identity special.ivp uses) and index back to the points. Bit-identical to the legacy per-point loop.
+        r_u, r_inv = np.unique(r, return_inverse=True)
+        iv_u = np.zeros((ms_c1, ns_c1, len(r_u)))
+        ivp_u = np.zeros((ms_c1, ns_c1, len(r_u)))
+        _v1010_iv_ivp(cms1, r_u, list(range(ns_c1)), iv_u, ivp_u)
+        iv_c1 = iv_u[:, :, r_inv]
+        ivp_c1 = ivp_u[:, :, r_inv]
+        del(r_u, r_inv, iv_u, ivp_u)
+    elif setup == 'legacy':
+        for m in range(ms_c1):
+            for n in range(ns_c1):
+                iv_c1[m][n] = special.iv(n, cms1[m]*r)
+                ivp_c1[m][n] = special.ivp(n, cms1[m]*r)
+    else:
+        raise ValueError(f"bessel_setup must be 'fast' or 'legacy', not {setup!r}")
     # first order correction for small r
     eps = 1e-7
     # dense array
