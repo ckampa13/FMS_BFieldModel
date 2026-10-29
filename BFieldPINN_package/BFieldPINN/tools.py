@@ -22,6 +22,20 @@ def get_GPU():
     dev = out.stdout.decode('utf-8').rstrip()
     return dev
 
+### reproducibility
+def set_determinism(tf_seed, np_seed=None, py_seed=None):
+    # Bit-reproducible training on fixed hardware + software (see README, "Reproducibility"). Call once, before building the PINN or drawing data.
+    # Seeds the TF global seed, Python's random (Keras draws the seed of an unseeded initializer from it, e.g. the output layer's default
+    # glorot_uniform; default py_seed = tf_seed) and numpy if np_seed is given (the train/validation split), then enables TF op determinism.
+    import random
+    py_seed = tf_seed if py_seed is None else py_seed
+    if np_seed is not None:
+        np.random.seed(np_seed)
+    tf.random.set_seed(tf_seed)
+    random.seed(py_seed)
+    tf.config.experimental.enable_op_determinism()
+    print(f'TF op determinism enabled; seeds: tf {tf_seed}, Python random {py_seed}, numpy {np_seed}')
+
 ### Prepare for refit
 def make_LSQ_df_PINN_subtracted(df, fname=None, name=None):
     # evaluate new Bi values based on PINN prediction dBi_NN
