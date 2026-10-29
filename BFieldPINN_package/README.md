@@ -43,7 +43,8 @@ given, op determinism); set `initializer_seed` and `colloc_seed` in the NN confi
 Notes:
 - Results are bit-identical only on the same GPU model, driver, CUDA / cuDNN and TensorFlow versions. Across machines, compare within the
   seed spread instead.
-- TensorFlow raises an error if an op has no deterministic GPU implementation (none in the current `ScalarPINN` training).
+- With op determinism on, TensorFlow raises an error if an op has no deterministic GPU implementation. The current `ScalarPINN` training
+  runs without such errors: every op it uses has one.
 - Verified 2026-10-28 (docdb-48750, model 1, RTX 2080 Ti, TF 2.14), 200-epoch runs: bit-identical in every per-epoch loss, all initial and
   trained weights and the predictions; full model-1 chains (PINN, LSQ refit, merge) on two different cards of the same model: bit-identical in all of
   these and in the final refit + PINN results; no measurable slowdown (1491 s vs ~1500-1650 s unseeded).
